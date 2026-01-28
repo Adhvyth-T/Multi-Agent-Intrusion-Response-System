@@ -1,0 +1,294 @@
+"""
+Detection Agent - Week 1, Days 3-5
+Monitors events, runs anomaly detection, classifies threats, generates alerts.
+"""
+
+import asyncio
+import json
+import uuid
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
+import numpy as np
+from sklearn.ensemble import IsolationForest
+import structlog
+
+from core import queue, save_incident, Incident, Severity
+
+log = structlog.get_logger()
+
+# Threat patterns for classification
+THREAT_PATTERNS = {
+    "cryptominer": {
+        "indicators": ["xmrig", "minerd", "stratum", "cryptonight", "coin", "pool"],
+        "processes": ["xmrig", "minerd", "cpuminer"],
+        "ports": [3333, 4444, 5555, 8333],
+        "severity": Severity.P1
+    },
+    "data_exfiltration": {
+        "indicators": ["curl", "wget", "nc", "ncat", "base64", "xxd"],
+        "domains": ["pastebin", "transfer.sh", "file.io"],
+        "severity": Severity.P1
+    },
+    "privilege_escalation": {
+        "indicators": ["sudo", "chmod 777", "chown root", "setuid", "/etc/passwd", "/etc/shadow"],
+        "paths": ["/etc/sudoers", "/root", "/proc/sys"],
+        "severity": Severity.P1
+    },
+    "reverse_shell": {
+        "indicators": ["bash -i", "/dev/tcp", "nc -e", "python -c", "perl -e"],
+        "severity": Severity.P1
+    },
+    "container_escape": {
+        "indicators": ["docker.sock", "hostPID", "hostNetwork", "privileged"],
+        "paths": ["/var/run/docker.sock", "/host"],
+        "severity": Severity.P1
+    },
+    "suspicious_process": {
+        "indicators": ["nmap", "masscan", "nikto", "sqlmap", "metasploit"],
+        "severity": Severity.P2
+    },
+    "config_tampering": {
+        "indicators": ["/etc/", "configmap", "secret", "env"],
+        "severity": Severity.P2
+    },
+    "anomalous_network": {
+        "indicators": ["unusual_port", "high_bandwidth", "external_ip"],
+        "severity": Severity.P3
+    }
+}
+
+@dataclass
+class DetectedEvent:
+    """Normalized event from various sources."""
+    source: str  # falco, prometheus, k8s_watch, simulator
+    event_type: str
+    resource: str
+    namespace: str
+    timestamp: datetime
+    details: Dict[str, Any]
+    raw: Dict[str, Any]
+
+class AnomalyDetector:
+    """ML-based anomaly detection using Isolation Forest."""
+    
+    def __init__(self):
+        self.model = IsolationForest(contamination=0.1, random_state=42)
+        self.baseline_data: List[np.ndarray] = []
+        self.trained = False
+        self.feature_names = ["cpu_usage", "memory_usage", "network_bytes", "process_count", "open_files"]
+    
+    def extract_features(self, event: DetectedEvent) -> np.ndarray:
+        """Extract numerical features from event."""
+        details = event.details
+        return np.array([
+            details.get("cpu_usage", 0),
+            details.get("memory_usage", 0),
+            details.get("network_bytes", 0),
+            details.get("process_count", 1),
+            details.get("open_files", 0)
+        ])
+    
+    def add_baseline(self, event: DetectedEvent):
+        """Add event to baseline data."""
+        features = self.extract_features(event)
+        self.baseline_data.append(features)
+        
+        # Train after collecting enough samples
+        if len(self.baseline_data) >= 50 and not self.trained:
+            self._train()
+    
+    def _train(self):
+        """Train the anomaly detection model."""
+        X = np.array(self.baseline_data)
+        self.model.fit(X)
+        self.trained = True
+        log.info("Anomaly detector trained", samples=len(self.baseline_data))
+    
+    def is_anomaly(self, event: DetectedEvent) -> tuple[bool, float]:
+        """Check if event is anomalous. Returns (is_anomaly, score)."""
+        if not self.trained:
+            return False, 0.0
+        
+        features = self.extract_features(event).reshape(1, -1)
+        prediction = self.model.predict(features)[0]
+        score = -self.model.score_samples(features)[0]  # Higher = more anomalous
+        
+        return prediction == -1, score
+
+class ThreatClassifier:
+    """Pattern-based threat classification."""
+    
+    def classify(self, event: DetectedEvent) -> tuple[Optional[str], Severity, float]:
+        """Classify event into threat type. Returns (threat_type, severity, confidence)."""
+        
+        # Convert event to searchable text
+        search_text = json.dumps(event.details).lower() + json.dumps(event.raw).lower()
+        
+        best_match = None
+        best_confidence = 0.0
+        best_severity = Severity.P4
+        
+        for threat_type, patterns in THREAT_PATTERNS.items():
+            matches = 0
+            total_indicators = len(patterns.get("indicators", []))
+            
+            # Check indicators
+            for indicator in patterns.get("indicators", []):
+                if indicator.lower() in search_text:
+                    matches += 1
+            
+            # Check processes
+            for proc in patterns.get("processes", []):
+                if proc.lower() in search_text:
+                    matches += 1
+                    total_indicators += 1
+            
+            # Check paths
+            for path in patterns.get("paths", []):
+                if path.lower() in search_text:
+                    matches += 1
+                    total_indicators += 1
+            
+            if total_indicators > 0 and matches > 0:
+                confidence = matches / total_indicators
+                if confidence > best_confidence:
+                    best_match = threat_type
+                    best_confidence = confidence
+                    best_severity = patterns["severity"]
+        
+        return best_match, best_severity, best_confidence
+
+class DetectionAgent:
+    """Main detection agent that monitors and classifies threats."""
+    
+    def __init__(self):
+        self.anomaly_detector = AnomalyDetector()
+        self.threat_classifier = ThreatClassifier()
+        self.running = False
+    
+    async def start(self):
+        """Start the detection agent."""
+        self.running = True
+        log.info("Detection Agent started")
+        
+        # Start listening for events from simulator
+        await self._event_loop()
+    
+    async def stop(self):
+        """Stop the detection agent."""
+        self.running = False
+        log.info("Detection Agent stopped")
+    
+    async def _event_loop(self):
+        """Main event processing loop."""
+        while self.running:
+            try:
+                # Get event from detection queue
+                event_data = await queue.pop("detection", timeout=5)
+                
+                if event_data:
+                    event = self._normalize_event(event_data)
+                    await self._process_event(event)
+            except Exception as e:
+                log.error("Error processing event", error=str(e))
+                await asyncio.sleep(1)
+    
+    def _normalize_event(self, raw_event: Dict[str, Any]) -> DetectedEvent:
+        """Normalize raw event into standard format."""
+        return DetectedEvent(
+            source=raw_event.get("source", "unknown"),
+            event_type=raw_event.get("type", "unknown"),
+            resource=raw_event.get("resource", "unknown"),
+            namespace=raw_event.get("namespace", "default"),
+            timestamp=datetime.fromisoformat(raw_event.get("timestamp", datetime.utcnow().isoformat())),
+            details=raw_event.get("details", {}),
+            raw=raw_event
+        )
+    
+    async def _process_event(self, event: DetectedEvent):
+        """Process a single event through detection pipeline."""
+        log.info("Processing event", source=event.source, type=event.event_type)
+        
+        # 1. Add to baseline for anomaly detection
+        self.anomaly_detector.add_baseline(event)
+        
+        # 2. Check for anomalies
+        is_anomaly, anomaly_score = self.anomaly_detector.is_anomaly(event)
+        
+        # 3. Classify threat
+        threat_type, severity, confidence = self.threat_classifier.classify(event)
+        
+        # 4. Determine if alert should be generated
+        should_alert = False
+        alert_reason = []
+        
+        if threat_type:
+            should_alert = True
+            alert_reason.append(f"Threat pattern match: {threat_type} (confidence: {confidence:.2f})")
+        
+        if is_anomaly:
+            should_alert = True
+            alert_reason.append(f"Anomaly detected (score: {anomaly_score:.2f})")
+            if severity == Severity.P4:
+                severity = Severity.P3  # Upgrade severity for anomalies
+        
+        # 5. Generate incident if alert triggered
+        if should_alert:
+            incident = await self._create_incident(event, threat_type, severity, confidence, alert_reason)
+            
+            # Push to triage queue
+            await queue.push("triage", incident.model_dump(mode='json'))
+            
+            # Push notification
+            await queue.push("notification", {
+                "type": "incident_detected",
+                "incident_id": incident.id,
+                "severity": incident.severity.value,
+                "threat_type": threat_type,
+                "resource": incident.resource,
+                "summary": "; ".join(alert_reason)
+            })
+            
+            log.info("Incident created", 
+                     incident_id=incident.id, 
+                     threat_type=threat_type,
+                     severity=severity.value)
+        # If no threat detected but event came from a security source, treat as suspicious
+        if not should_alert and event.source in ["falco", "simulator"]:
+            should_alert = True
+            threat_type = threat_type or "suspicious_activity"
+            severity = Severity.P3
+            alert_reason.append("Event from security monitoring source")
+
+    async def _create_incident(
+        self, 
+        event: DetectedEvent, 
+        threat_type: Optional[str],
+        severity: Severity,
+        confidence: float,
+        reasons: List[str]
+    ) -> Incident:
+        """Create and save incident from detected event."""
+        
+        incident = Incident(
+            type=threat_type or "unknown",
+            severity=severity,
+            source=event.source,
+            resource=event.resource,
+            namespace=event.namespace,
+            raw_event={
+                "event": event.raw,
+                "detection_confidence": confidence,
+                "detection_reasons": reasons,
+                "anomaly_detection": self.anomaly_detector.trained
+            }
+        )
+        
+        # Save to database
+        await save_incident(incident.model_dump(mode='json'))
+        
+        return incident
+
+# Agent instance
+detection_agent = DetectionAgent()

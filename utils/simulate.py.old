@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+Simple attack simulator CLI.
+Usage:
+    python simulate.py single [attack_type]
+    python simulate.py batch [count] [attack_type]
+    python simulate.py list
+    python simulate.py approve <action_id>
+"""
+
+import asyncio
+import sys
+
+async def main():
+    from core import queue
+    from attack_simulator import attack_simulator, ATTACK_SCENARIOS
+    
+    await queue.connect()
+    
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python simulate.py single [attack_type]")
+        print("  python simulate.py batch [count] [attack_type]")
+        print("  python simulate.py list")
+        print("  python simulate.py approve <action_id>")
+        await queue.disconnect()
+        return
+    
+    cmd = sys.argv[1]
+    
+    if cmd == "single":
+        attack_type = sys.argv[2] if len(sys.argv) > 2 else None
+        if attack_type and attack_type not in ATTACK_SCENARIOS:
+            print(f"Unknown attack type: {attack_type}")
+            print(f"Available: {', '.join(ATTACK_SCENARIOS.keys())}")
+        else:
+            event = await attack_simulator.generate_attack(attack_type)
+            print(f"✅ Attack generated: {event['type']} on {event['resource']}")
+    
+    elif cmd == "batch":
+        count = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        attack_type = sys.argv[3] if len(sys.argv) > 3 else None
+        await attack_simulator.generate_batch(count, attack_type)
+        print(f"✅ Generated {count} attacks")
+    
+    elif cmd == "list":
+        print("\nAvailable attack types:")
+        print("-" * 50)
+        for name, scenario in ATTACK_SCENARIOS.items():
+            desc = scenario['raw'].get('rule', scenario['raw'].get('alert', 'N/A'))
+            print(f"  {name:20} - {desc}")
+        print()
+    
+    elif cmd == "approve":
+        if len(sys.argv) < 3:
+            print("Usage: python simulate.py approve <action_id>")
+        else:
+            action_id = sys.argv[2]
+            await queue.push(f"approval:{action_id}", {
+                "approved": True,
+                "approved_by": "cli_user"
+            })
+            print(f"✅ Approval sent for action: {action_id}")
+    
+    elif cmd == "reject":
+        if len(sys.argv) < 3:
+            print("Usage: python simulate.py reject <action_id>")
+        else:
+            action_id = sys.argv[2]
+            await queue.push(f"approval:{action_id}", {
+                "approved": False,
+                "rejected_by": "cli_user"
+            })
+            print(f"❌ Rejection sent for action: {action_id}")
+    
+    elif cmd == "status":
+        from core import get_trust_metrics, get_recent_incidents
+        
+        metrics = await get_trust_metrics()
+        incidents = await get_recent_incidents(5)
+        
+        print("\n" + "="*50)
+        print("SYSTEM STATUS")
+        print("="*50)
+        print(f"Trust Level: {metrics.get('current_level', 1)}")
+        print(f"Total Actions: {metrics.get('total_actions', 0)}")
+        print(f"Successful: {metrics.get('successful_actions', 0)}")
+        print(f"Failed: {metrics.get('failed_actions', 0)}")
+        
+        if incidents:
+            print("\nRecent Incidents:")
+            for inc in incidents:
+                print(f"  [{inc.get('severity', 'P4')}] {inc.get('id')} - {inc.get('type')} ({inc.get('status')})")
+        print()
+    
+    else:
+        print(f"Unknown command: {cmd}")
+    
+    await queue.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
