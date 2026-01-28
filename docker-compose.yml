@@ -1,0 +1,36 @@
+services:
+  falco:
+    image: falcosecurity/falco:0.37.1
+    container_name: ir-falco
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - ./falco-config:/etc/falco
+    environment:
+      - SKIP_DRIVER_LOADER=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - /usr/bin/falco
+      - --modern-bpf
+      - -c
+      - /etc/falco/falco.yaml
+    networks:
+      - attack-net
+
+  nginx-victim:
+    image: nginx:1.19.0
+    container_name: victim-nginx
+    networks:
+      - attack-net
+
+  redis-victim:
+    image: redis:5.0
+    container_name: victim-redis
+    networks:
+      - attack-net
+
+networks:
+  attack-net:
+    driver: bridge
