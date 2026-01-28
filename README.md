@@ -2,7 +2,7 @@
 
 AI-powered security incident detection, triage, and response system with progressive trust.
 
-## Quick Start
+## Quick Start(api)
 
 ```bash
 # 1. Install dependencies
@@ -23,7 +23,10 @@ python simulate.py single cryptominer
 python simulate.py batch 5
 python simulate.py status
 ```
-
+## Run streamlit app via cmd line(Windows)
+```bash
+.\run.bat
+```
 ## Architecture
 
 ```
