@@ -49,7 +49,7 @@ async def init_db():
                 FOREIGN KEY (incident_id) REFERENCES incidents(id)
             );
             
-            -- Actions taken
+            -- Actions taken (UPDATED WITH IVAM COLUMNS)
             CREATE TABLE IF NOT EXISTS actions (
                 id TEXT PRIMARY KEY,
                 incident_id TEXT NOT NULL,
@@ -57,9 +57,16 @@ async def init_db():
                 params TEXT,
                 status TEXT DEFAULT 'pending',
                 result TEXT,
+                details TEXT,
                 approved_by TEXT,
                 executed_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                
+                -- IVAM validation fields
+                verified INTEGER DEFAULT 0,
+                duration_seconds REAL,
+                snapshot_id TEXT,
+                
                 FOREIGN KEY (incident_id) REFERENCES incidents(id)
             );
             
@@ -100,6 +107,64 @@ async def init_db():
             -- Initialize trust metrics if not exists
             INSERT OR IGNORE INTO trust_metrics (id, total_actions, current_level) 
             VALUES (1, 0, 1);
+            
+            -- Validation attempts (IVAM tracking)
+            CREATE TABLE IF NOT EXISTS validation_attempts (
+                id TEXT PRIMARY KEY,
+                action_id TEXT NOT NULL,
+                incident_id TEXT NOT NULL,
+                phase TEXT NOT NULL,  -- 'immediate', 'sustained', 'effective'
+                success INTEGER DEFAULT 0,
+                message TEXT,
+                details TEXT,  -- JSON
+                validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (action_id) REFERENCES actions(id),
+                FOREIGN KEY (incident_id) REFERENCES incidents(id)
+            );
+
+            -- Action attempts with fallback tracking
+            CREATE TABLE IF NOT EXISTS action_attempts (
+                id TEXT PRIMARY KEY,
+                incident_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                strategy_level INTEGER DEFAULT 1,  -- Escalation level (1, 2, 3, 4)
+                attempt_number INTEGER DEFAULT 1,  -- Retry count
+                parent_attempt_id TEXT,  -- Links to previous failed attempt
+    
+                -- Execution
+                executed_at TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                result TEXT,
+                details TEXT,  -- JSON
+    
+                -- Validation
+                phase1_success INTEGER DEFAULT 0,
+                phase1_message TEXT,
+                phase1_validated_at TIMESTAMP,
+    
+                phase2_success INTEGER DEFAULT 0,
+                phase2_message TEXT,
+                phase2_validated_at TIMESTAMP,
+    
+                phase3_success INTEGER DEFAULT 0,
+                phase3_message TEXT,
+                phase3_validated_at TIMESTAMP,
+    
+                -- Fallback
+                fallback_triggered INTEGER DEFAULT 0,
+                fallback_reason TEXT,
+                fallback_action_id TEXT,  -- Next action in escalation
+    
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (incident_id) REFERENCES incidents(id),
+                FOREIGN KEY (parent_attempt_id) REFERENCES action_attempts(id)
+            );
+
+            -- Index for fast lookups
+            CREATE INDEX IF NOT EXISTS idx_validation_action ON validation_attempts(action_id);
+            CREATE INDEX IF NOT EXISTS idx_validation_incident ON validation_attempts(incident_id);
+            CREATE INDEX IF NOT EXISTS idx_attempts_incident ON action_attempts(incident_id);
+            CREATE INDEX IF NOT EXISTS idx_attempts_parent ON action_attempts(parent_attempt_id);
         """)
         await db.commit()
 
@@ -247,3 +312,98 @@ async def get_recent_incidents(limit: int = 10) -> List[Dict]:
         """, (limit,)) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+        
+async def save_validation_result(validation: Dict[str, Any]):
+    """Save IVAM validation result."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO validation_attempts 
+            (id, action_id, incident_id, phase, success, message, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            validation['id'],
+            validation['action_id'],
+            validation['incident_id'],
+            validation['phase'],
+            1 if validation['success'] else 0,
+            validation['message'],
+            json.dumps(validation.get('details', {}))
+        ))
+        await db.commit()
+
+async def get_validation_results(action_id: str):
+    """Get all validation results for an action."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT * FROM validation_attempts 
+            WHERE action_id = ? 
+            ORDER BY validated_at ASC
+        """, (action_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+async def save_action_attempt(attempt: Dict[str, Any]):
+    """Save action attempt with fallback tracking."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO action_attempts 
+            (id, incident_id, action_type, strategy_level, attempt_number, 
+             parent_attempt_id, executed_at, status, result, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            attempt['id'],
+            attempt['incident_id'],
+            attempt['action_type'],
+            attempt.get('strategy_level', 1),
+            attempt.get('attempt_number', 1),
+            attempt.get('parent_attempt_id'),
+            attempt.get('executed_at'),
+            attempt.get('status', 'pending'),
+            attempt.get('result'),
+            json.dumps(attempt.get('details', {}))
+        ))
+        await db.commit()
+
+async def update_action_attempt_validation(
+    attempt_id: str,
+    phase: str,
+    success: bool,
+    message: str
+):
+    """Update validation results for an action attempt."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if phase == "immediate":
+            await db.execute("""
+                UPDATE action_attempts 
+                SET phase1_success = ?, phase1_message = ?, phase1_validated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (1 if success else 0, message, attempt_id))
+        elif phase == "sustained":
+            await db.execute("""
+                UPDATE action_attempts 
+                SET phase2_success = ?, phase2_message = ?, phase2_validated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (1 if success else 0, message, attempt_id))
+        elif phase == "effective":
+            await db.execute("""
+                UPDATE action_attempts 
+                SET phase3_success = ?, phase3_message = ?, phase3_validated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (1 if success else 0, message, attempt_id))
+        
+        await db.commit()
+
+async def mark_fallback_triggered(
+    attempt_id: str,
+    reason: str,
+    fallback_action_id: str
+):
+    """Mark that fallback was triggered for this attempt."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE action_attempts 
+            SET fallback_triggered = 1, fallback_reason = ?, fallback_action_id = ?
+            WHERE id = ?
+        """, (reason, fallback_action_id, attempt_id))
+        await db.commit()

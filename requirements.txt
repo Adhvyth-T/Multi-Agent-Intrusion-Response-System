@@ -30,6 +30,6 @@ structlog>=23.0.0
 # gRPC requirements
 grpcio==1.60.0
 grpcio-tools==1.60.0
-docker==7.0.0
+docker==6.1.3
 
 streamlit>=1.30.0

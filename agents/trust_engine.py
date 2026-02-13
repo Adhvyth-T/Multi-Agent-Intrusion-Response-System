@@ -1,6 +1,8 @@
 """
 Progressive Trust Engine - Week 2, Days 5-7
 Manages trust levels, decides auto vs. approval, handles feedback.
+
+FIXED: Now passes incident resource to Containment Agent
 """
 
 import asyncio
@@ -13,7 +15,7 @@ from config import config
 from core import (
     queue, get_trust_metrics, update_trust_metrics, save_action_history,
     get_similar_actions, save_action, update_incident, ActionMode,
-    TrustLevel, IncidentStatus
+    TrustLevel, IncidentStatus, get_incident  # ← ADDED get_incident
 )
 
 log = structlog.get_logger()
@@ -222,13 +224,33 @@ class ProgressiveTrustEngine:
         """Execute actions automatically."""
         await update_incident(incident_id, {"status": IncidentStatus.CONTAINMENT.value})
         
+        # 🔥 FIX: Get incident details to extract resource
+        incident = await get_incident(incident_id)
+        
+        if not incident:
+            log.error("Incident not found for auto-execution", incident_id=incident_id)
+            return
+        
+        # Extract resource and namespace from incident
+        resource = incident.get("resource", "unknown")
+        namespace = incident.get("namespace", "docker")
+        
+        log.debug("Auto-executing actions",
+                 incident_id=incident_id,
+                 resource=resource,
+                 namespace=namespace,
+                 actions_count=len(actions))
+        
         for action in actions:
             action_data = {
                 "id": f"act-{incident_id[:4]}-{action.get('priority', 0)}",
                 "incident_id": incident_id,
                 "action_type": action.get("action"),
                 "params": action.get("params", {}),
-                "status": "auto_approved"
+                "status": "auto_approved",
+                # 🔥 FIX: Add resource and namespace from incident
+                "resource": resource,
+                "namespace": namespace
             }
             
             await save_action(action_data)
@@ -245,12 +267,29 @@ class ProgressiveTrustEngine:
             "incident_id": incident_id,
             "severity": "P3",
             "actions_count": len(actions),
-            "summary": f"Auto-executing {len(actions)} containment actions"
+            "summary": f"Auto-executing {len(actions)} containment actions on {resource}"
         })
     
     async def _request_approval(self, incident_id: str, actions: List[Dict], severity: str):
         """Request approval for actions."""
         await update_incident(incident_id, {"status": IncidentStatus.PENDING_APPROVAL.value})
+        
+        # 🔥 FIX: Get incident details
+        incident = await get_incident(incident_id)
+        
+        if not incident:
+            log.error("Incident not found for approval", incident_id=incident_id)
+            return
+        
+        # Extract resource and namespace from incident
+        resource = incident.get("resource", "unknown")
+        namespace = incident.get("namespace", "docker")
+        
+        log.debug("Requesting approval for actions",
+                 incident_id=incident_id,
+                 resource=resource,
+                 namespace=namespace,
+                 actions_count=len(actions))
         
         for action in actions:
             action_id = f"act-{incident_id[:4]}-{action.get('priority', 0)}"
@@ -261,7 +300,10 @@ class ProgressiveTrustEngine:
                 "action_type": action.get("action"),
                 "params": action.get("params", {}),
                 "status": "pending_approval",
-                "severity": severity
+                "severity": severity,
+                # 🔥 FIX: Add resource and namespace
+                "resource": resource,
+                "namespace": namespace
             }
             
             await save_action(action_data)
@@ -286,7 +328,7 @@ class ProgressiveTrustEngine:
                 "incident_id": action_data.get("incident_id"),
                 "action_id": action_data.get("action_id"),
                 "severity": "P3",
-                "summary": f"Action {action_data.get('action_type')} approved"
+                "summary": f"Action {action_data.get('action_type')} approved for {action_data.get('resource')}"
             })
         else:
             await queue.push("notification", {

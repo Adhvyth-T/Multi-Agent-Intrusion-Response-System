@@ -28,12 +28,21 @@ log = structlog.get_logger()
 async def main():
     """Main entry point - starts all agents."""
     from core import init_db, queue
-    from agents import detection_agent, communication_agent, triage_agent, trust_engine
+    from core.actions import ActionRegistry
+    from agents import (
+        detection_agent, communication_agent, triage_agent, 
+        trust_engine, containment_agent,validation_service
+    )
     from collectors import CollectorFactory
+    from config import config
     
     log.info("="*60)
     log.info("🚀 Autonomous Incident Response System")
     log.info("="*60)
+    
+    # Show configuration
+    if config.DRY_RUN:
+        log.warning("🧪 DRY RUN MODE ENABLED - Actions will be simulated")
     
     # Initialize database
     log.info("Initializing database...")
@@ -42,6 +51,30 @@ async def main():
     # Connect to Redis
     log.info("Connecting to Redis...")
     await queue.connect()
+    
+    # Show available action executors
+    log.info("")
+    log.info("="*60)
+    log.info("⚙️  Action Execution System")
+    log.info("="*60)
+    available_actions = ActionRegistry.list_available()
+    capabilities = ActionRegistry.get_capabilities()
+    
+    log.info(f"Registered action executors: {len(available_actions)}")
+    for action_name in available_actions:
+        cap = capabilities.get(action_name)
+        if cap:
+            destructive_marker = "🔴" if cap.destructive else "🟢"
+            reversible_marker = "↩️" if cap.reversible else "  "
+            log.info(f"  {destructive_marker} {reversible_marker} {action_name:<20} - {cap.description}")
+        else:
+            log.info(f"     {action_name}")
+    
+    log.info("")
+    log.info("Legend:")
+    log.info("  🔴 = Destructive action")
+    log.info("  🟢 = Non-destructive action")
+    log.info("  ↩️ = Reversible action")
     
     # Environment detection and collector selection
     log.info("")
@@ -111,6 +144,14 @@ async def main():
     agents.append(asyncio.create_task(trust_engine.start(), name="trust_engine"))
     log.info("✓ Progressive Trust Engine started")
     
+    # Start Containment Agent (executes actions)
+    agents.append(asyncio.create_task(containment_agent.start(), name="containment"))
+    log.info("✓ Containment Agent started")
+    
+    # Start Validation Service (Validates actions and provides feedback)
+    validation_task = asyncio.create_task(validation_service.start(), name="validation_service")
+    agents.append(validation_task)
+    log.info("✓ Validation Service started")
     log.info("")
     log.info("="*60)
     log.info("🎯 System Status: OPERATIONAL")
@@ -119,11 +160,13 @@ async def main():
     # Show system configuration
     log.info("Configuration:")
     log.info(f"  • Event Collector: {collector.name}")
-    log.info("  • Detection: ML-based anomaly detection")
-    log.info("  • Triage: LLM-powered analysis")
+    log.info(f"  • Detection: ML-based anomaly detection")
+    log.info(f"  • Triage: LLM-powered analysis")
     log.info(f"  • Trust Level: Level 1 (Learning mode)")
-    log.info("  • Database: SQLite (local)")
-    log.info("  • Queue: Redis")
+    log.info(f"  • Containment: {len(available_actions)} action executors")
+    log.info(f"  • Database: SQLite (local)")
+    log.info(f"  • Queue: Redis")
+    log.info(f"  • Dry Run: {'ENABLED' if config.DRY_RUN else 'DISABLED'}")
     
     log.info("")
     log.info("="*60)
@@ -141,14 +184,17 @@ async def main():
     log.info("="*60)
     log.info("⚙️  Environment Variables")
     log.info("="*60)
-    log.info("Override collector selection:")
+    log.info("Override settings:")
     log.info("")
-    log.info("  IR_COLLECTOR=docker     - Force Docker API collector")
-    log.info("  IR_COLLECTOR=falco      - Force Falco collector (Linux)")
-    log.info("  IR_COLLECTOR=kubernetes - Force K8s API collector")
+    log.info("  IR_COLLECTOR=docker        - Force Docker API collector")
+    log.info("  IR_COLLECTOR=falco         - Force Falco collector (Linux)")
+    log.info("  IR_COLLECTOR=kubernetes    - Force K8s API collector")
+    log.info("  IR_DRY_RUN=true            - Enable dry run mode")
+    log.info("  IR_ENABLE_SNAPSHOTS=false  - Disable forensic snapshots")
     log.info("")
-    current_setting = os.getenv('IR_COLLECTOR', 'auto-detect')
-    log.info(f"Current: {current_setting}")
+    current_collector = os.getenv('IR_COLLECTOR', 'auto-detect')
+    current_dry_run = os.getenv('IR_DRY_RUN', 'false')
+    log.info(f"Current: IR_COLLECTOR={current_collector}, IR_DRY_RUN={current_dry_run}")
     log.info("")
     
     log.info("="*60)
@@ -195,6 +241,7 @@ async def main():
     communication_agent.running = False
     triage_agent.running = False
     trust_engine.running = False
+    containment_agent.running = False
     
     # Cancel all tasks
     for task in agents:
@@ -211,11 +258,23 @@ async def main():
     log.info("="*60)
     log.info("📈 Final Statistics")
     log.info("="*60)
-    metrics = collector.get_metrics()
-    log.info(f"  Events processed: {metrics['events_processed']}")
-    log.info(f"  Threats detected: {metrics['threats_detected']}")
-    log.info(f"  Uptime: {metrics['uptime_seconds']:.1f}s")
-    log.info(f"  Errors: {metrics['errors']}")
+    
+    # Collector stats
+    collector_metrics = collector.get_metrics()
+    log.info(f"Collector:")
+    log.info(f"  Events processed: {collector_metrics['events_processed']}")
+    log.info(f"  Threats detected: {collector_metrics['threats_detected']}")
+    log.info(f"  Errors: {collector_metrics['errors']}")
+    
+    # Containment stats
+    containment_stats = containment_agent.get_stats()
+    log.info(f"Containment:")
+    log.info(f"  Actions executed: {containment_stats['total_executions']}")
+    log.info(f"  Successful: {containment_stats['successful']}")
+    log.info(f"  Failed: {containment_stats['failed']}")
+    log.info(f"  Success rate: {containment_stats['success_rate']:.1%}")
+    
+    log.info(f"Uptime: {collector_metrics['uptime_seconds']:.1f}s")
     log.info("")
     
     log.info("="*60)
