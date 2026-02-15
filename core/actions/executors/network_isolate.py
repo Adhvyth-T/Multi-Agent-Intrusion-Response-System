@@ -187,7 +187,7 @@ class NetworkIsolateExecutor(BaseActionExecutor):
                 check=False
             )
             
-            if success:
+            if success and inspect_json.strip():
                 import json
                 networks = json.loads(inspect_json)
                 

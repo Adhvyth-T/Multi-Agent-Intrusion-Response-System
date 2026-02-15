@@ -1,3 +1,4 @@
+#models.py
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -8,7 +9,7 @@ class Severity(str, Enum):
     P1 = "P1"  # Critical
     P2 = "P2"  # High
     P3 = "P3"  # Medium
-    P4 = "P4"  # Low
+    P4 = "P4"  # Low prority
 
 class IncidentStatus(str, Enum):
     DETECTED = "detected"

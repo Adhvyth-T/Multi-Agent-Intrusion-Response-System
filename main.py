@@ -31,7 +31,7 @@ async def main():
     from core.actions import ActionRegistry
     from agents import (
         detection_agent, communication_agent, triage_agent, 
-        trust_engine, containment_agent,validation_service
+        trust_engine, containment_agent,validation_service, investigation_agent
     )
     from collectors import CollectorFactory
     from config import config
@@ -98,13 +98,15 @@ async def main():
     
     # Create the best collector for this environment
     try:
-        collector = await CollectorFactory.create_collector()
+        collector = await CollectorFactory.create_all_collectors()
+        security_collector = collector['security']
         log.info("")
-        log.info(f"✨ Selected: {collector.name.upper()}")
+        log.info(f"✨ Selected: {security_collector.name.upper()}")
+        log.info(f"✨ Investigation Collectors: {len(collector) - 1} ready")
         log.info("="*60)
         
         # Show collector capabilities
-        capabilities = collector.get_capabilities()
+        capabilities = security_collector.get_capabilities()
         log.info("Collector Capabilities:")
         for cap, enabled in capabilities.items():
             if enabled:
@@ -125,8 +127,8 @@ async def main():
     log.info("")
     
     # Start Event Collector FIRST (feeds detection agent)
-    agents.append(asyncio.create_task(collector.start(), name="event_collector"))
-    log.info(f"✓ Event Collector started ({collector.name})")
+    agents.append(asyncio.create_task(security_collector.start(), name="event_collector"))
+    log.info(f"✓ Event Collector started ({security_collector.name})")
     
     # Start Communication Agent (handles all notifications)
     agents.append(asyncio.create_task(communication_agent.start(), name="communication"))
@@ -152,6 +154,11 @@ async def main():
     validation_task = asyncio.create_task(validation_service.start(), name="validation_service")
     agents.append(validation_task)
     log.info("✓ Validation Service started")
+
+        # Start Investigation Agent (Performs deeper analysis and forensics)
+    agents.append(asyncio.create_task(investigation_agent.start(), name="investigation"))
+    log.info("✓ Investigation Agent started")
+    
     log.info("")
     log.info("="*60)
     log.info("🎯 System Status: OPERATIONAL")
@@ -159,7 +166,7 @@ async def main():
     
     # Show system configuration
     log.info("Configuration:")
-    log.info(f"  • Event Collector: {collector.name}")
+    log.info(f"  • Event Collector: {security_collector.name}")
     log.info(f"  • Detection: ML-based anomaly detection")
     log.info(f"  • Triage: LLM-powered analysis")
     log.info(f"  • Trust Level: Level 1 (Learning mode)")
@@ -234,7 +241,7 @@ async def main():
     log.info("Stopping system components...")
     
     # Stop collector
-    await collector.stop()
+    await security_collector.stop()
     
     # Stop agents
     detection_agent.running = False
@@ -242,6 +249,7 @@ async def main():
     triage_agent.running = False
     trust_engine.running = False
     containment_agent.running = False
+    investigation_agent.running = False
     
     # Cancel all tasks
     for task in agents:
@@ -260,7 +268,7 @@ async def main():
     log.info("="*60)
     
     # Collector stats
-    collector_metrics = collector.get_metrics()
+    collector_metrics = security_collector.get_metrics()
     log.info(f"Collector:")
     log.info(f"  Events processed: {collector_metrics['events_processed']}")
     log.info(f"  Threats detected: {collector_metrics['threats_detected']}")

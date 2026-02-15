@@ -1,3 +1,4 @@
+#database.py
 import aiosqlite
 import json
 from datetime import datetime
@@ -20,6 +21,7 @@ async def init_db():
                 resource TEXT,
                 namespace TEXT,
                 raw_event TEXT,
+                investigation_report TEXT,              
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -159,7 +161,7 @@ async def init_db():
                 FOREIGN KEY (incident_id) REFERENCES incidents(id),
                 FOREIGN KEY (parent_attempt_id) REFERENCES action_attempts(id)
             );
-
+            
             -- Index for fast lookups
             CREATE INDEX IF NOT EXISTS idx_validation_action ON validation_attempts(action_id);
             CREATE INDEX IF NOT EXISTS idx_validation_incident ON validation_attempts(incident_id);

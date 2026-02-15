@@ -12,7 +12,7 @@ import structlog
 from config import config
 from core import queue, update_incident, save_action, update_action, IncidentStatus
 from core.actions import ActionRegistry, ActionResult, ActionStatus, ForensicSnapshot
-
+import json
 log = structlog.get_logger()
 
 
@@ -312,7 +312,7 @@ class ContainmentAgent:
             await update_action(action_id, {
                 "status": result.status.value,
                 "result": result.message,
-                "details": result.details,
+                "details": json.dumps(result.details) if result.details else {},
                 "verified": result.verified_immediate,
                 "executed_at": result.completed_at.isoformat() if result.completed_at else None,
                 "duration_seconds": result.duration_seconds

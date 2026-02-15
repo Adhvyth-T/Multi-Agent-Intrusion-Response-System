@@ -1,0 +1,23 @@
+@"
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+evidence/
+.env
+.old
+*.db
+ir_system.db
+ml_models/datasets/raw/
+*.csv
+*.xls
+*.xlsx
+*.pcap
+"@ | Out-File -FilePath .gitignore -Encoding UTF8

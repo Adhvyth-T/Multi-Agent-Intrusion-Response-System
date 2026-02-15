@@ -187,6 +187,7 @@ class ValidationService:
                 # Trigger early investigation
                 await queue.push("investigation", {
                     "incident_id": incident_id,
+                    "resource": resource,
                     "priority": "URGENT",
                     "reason": "Containment ineffective",
                     "validation_failure": {
@@ -204,6 +205,7 @@ class ValidationService:
                     "incident_id": incident_id,
                     "action_id": action_id,
                     "action_type": action_type,
+                    "resource": resource,
                     "validation_complete": True
                 })
             

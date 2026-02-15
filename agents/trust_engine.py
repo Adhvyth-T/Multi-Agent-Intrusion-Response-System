@@ -2,10 +2,14 @@
 Progressive Trust Engine - Week 2, Days 5-7
 Manages trust levels, decides auto vs. approval, handles feedback.
 
-FIXED: Now passes incident resource to Containment Agent
+FIXED: 
+1. Now passes incident resource to Containment Agent
+2. Handles UNIQUE constraint errors with proper ID generation
+3. Uses UUID for truly unique action IDs
 """
 
 import asyncio
+import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
@@ -115,6 +119,45 @@ class ProgressiveTrustEngine:
     def __init__(self):
         self.approval_manager = ApprovalManager()
         self.running = False
+    
+    def generate_unique_action_id(self, incident_id: str, action_type: str) -> str:
+        """Generate a unique action ID."""
+        # Use first 4 chars of incident_id + timestamp + short UUID
+        timestamp = int(datetime.utcnow().timestamp() * 1000) % 10000  # Last 4 digits of timestamp
+        short_uuid = str(uuid.uuid4())[:8]
+        return f"act-{incident_id[:4]}-{action_type[:4]}-{timestamp}-{short_uuid}"
+    
+    async def safe_save_action(self, action_data: Dict[str, Any], max_retries: int = 3) -> bool:
+        """Safely save action with retry logic for UNIQUE constraint errors."""
+        for attempt in range(max_retries):
+            try:
+                await save_action(action_data)
+                return True
+            except Exception as e:
+                error_msg = str(e).lower()
+                
+                if "unique constraint failed" in error_msg:
+                    # Generate new unique ID and retry
+                    old_id = action_data.get("id")
+                    new_id = self.generate_unique_action_id(
+                        action_data.get("incident_id", "unknown"),
+                        action_data.get("action_type", "unknown")
+                    )
+                    action_data["id"] = new_id
+                    action_data["action_id"] = new_id  # Update both id fields
+                    
+                    log.warning("Action ID collision, retrying with new ID",
+                              old_id=old_id,
+                              new_id=new_id,
+                              attempt=attempt + 1)
+                    continue
+                else:
+                    # Other error, don't retry
+                    log.error("Failed to save action", error=str(e), action_data=action_data)
+                    return False
+        
+        log.error("Failed to save action after retries", action_data=action_data)
+        return False
     
     async def start(self):
         """Start the trust engine."""
@@ -241,9 +284,13 @@ class ProgressiveTrustEngine:
                  namespace=namespace,
                  actions_count=len(actions))
         
-        for action in actions:
+        successful_saves = 0
+        for i, action in enumerate(actions):
+            # Generate unique action ID
+            action_id = self.generate_unique_action_id(incident_id, action.get("action", "unknown"))
+            
             action_data = {
-                "id": f"act-{incident_id[:4]}-{action.get('priority', 0)}",
+                "id": action_id,
                 "incident_id": incident_id,
                 "action_type": action.get("action"),
                 "params": action.get("params", {}),
@@ -253,21 +300,28 @@ class ProgressiveTrustEngine:
                 "namespace": namespace
             }
             
-            await save_action(action_data)
-            
-            # Push to containment queue
-            await queue.push("containment", {
-                **action_data,
-                "confidence": confidence,
-                "auto_approved": True
-            })
+            # Use safe save with retry logic
+            if await self.safe_save_action(action_data):
+                successful_saves += 1
+                
+                # Push to containment queue
+                await queue.push("containment", {
+                    **action_data,
+                    "action_id": action_id,  # Ensure action_id is set
+                    "confidence": confidence,
+                    "auto_approved": True
+                })
+            else:
+                log.error("Failed to save action for auto-execution", 
+                         action_id=action_id, 
+                         incident_id=incident_id)
         
         await queue.push("notification", {
             "type": "actions_auto_approved",
             "incident_id": incident_id,
             "severity": "P3",
-            "actions_count": len(actions),
-            "summary": f"Auto-executing {len(actions)} containment actions on {resource}"
+            "actions_count": successful_saves,
+            "summary": f"Auto-executing {successful_saves}/{len(actions)} containment actions on {resource}"
         })
     
     async def _request_approval(self, incident_id: str, actions: List[Dict], severity: str):
@@ -291,8 +345,11 @@ class ProgressiveTrustEngine:
                  namespace=namespace,
                  actions_count=len(actions))
         
-        for action in actions:
-            action_id = f"act-{incident_id[:4]}-{action.get('priority', 0)}"
+        successful_saves = 0
+        for i, action in enumerate(actions):
+            # Generate unique action ID
+            action_id = self.generate_unique_action_id(incident_id, action.get("action", "unknown"))
+            
             action_data = {
                 "id": action_id,
                 "action_id": action_id,
@@ -306,10 +363,16 @@ class ProgressiveTrustEngine:
                 "namespace": namespace
             }
             
-            await save_action(action_data)
-            
-            # Request approval (non-blocking for demo)
-            asyncio.create_task(self._handle_approval(action_data))
+            # Use safe save with retry logic
+            if await self.safe_save_action(action_data):
+                successful_saves += 1
+                
+                # Request approval (non-blocking for demo)
+                asyncio.create_task(self._handle_approval(action_data))
+            else:
+                log.error("Failed to save action for approval", 
+                         action_id=action_id, 
+                         incident_id=incident_id)
     
     async def _handle_approval(self, action_data: Dict[str, Any]):
         """Handle the approval process for a single action."""

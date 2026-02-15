@@ -102,6 +102,8 @@ Docker Event → Detection (ML + Patterns) → Incident Created
                           Validation Service (Background)
                                                ↓
                             Phase 2 (5 min) → Phase 3 → Done ✓
+                                               ↓
+                                    Investigation Agent
 ```
 
 ---
@@ -290,46 +292,6 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 ```
 
----
-
-## 📁 Project Structure
-
-```
-Multi-Agent-IR-System/
-├── agents/
-│   ├── detection_agent.py        # Monitors & detects threats
-│   ├── triage_agent.py           # LLM-powered analysis
-│   ├── containment_agent.py      # Executes containment actions
-│   ├── validation_service.py     # IVAM Phase 2+3 validation
-│   └── communication_agent.py    # Notifications & reports
-├── core/
-│   ├── actions/                  # Containment executors
-│   │   ├── base.py              # Base executor with IVAM
-│   │   ├── delete_pod.py        # Delete container
-│   │   ├── network_isolate.py   # Network isolation
-│   │   ├── pause_container.py   # Pause execution
-│   │   ├── restart_container.py # Restart container
-│   │   └── resource_limit.py    # Resource throttling
-│   ├── trust_engine.py          # Progressive trust logic
-│   ├── database.py              # SQLite operations
-│   ├── queue.py                 # Redis queue wrapper
-│   └── __init__.py              # Core exports
-├── collectors/
-│   └── docker_collector.py      # Container event monitoring
-├── ml_models/
-│   └── anomaly_detector.py      # Isolation Forest
-├── attack_simulator/
-│   └── simulate_attacks.py      # Testing scenarios
-├── config/
-│   └── config.py                # Configuration
-├── main.py                       # System entry point
-├── simulate.py                   # Attack simulator CLI
-├── approve.py                    # Manual approval tool
-├── migrate_db.py                 # Database migration
-├── requirements.txt
-├── .env.example
-└── README.md
-```
 
 ---
 
@@ -429,6 +391,10 @@ sqlite3 ir_system.db "SELECT * FROM validation_attempts WHERE action_id='<action
 
 # View containment actions
 sqlite3 ir_system.db "SELECT * FROM actions WHERE status='success'"
+
+#View recommendations from investigation agent
+sqlite3 ir_system.db "SELECT investigation_report FROM incidents WHERE id = '<incident_id>'"
+
 ```
 
 ### Logs
@@ -457,12 +423,11 @@ tail -f logs/ir_system.log | grep "IVAM"
 - [x] Communication Agent (Email + Terminal)
 - [x] Attack simulator with 5 threat types
 - [x] Database with validation tracking
-
-### In Progress 🔄
 - [ ] Investigation Agent (Week 3, Days 6-7)
   - Root cause analysis
   - IOC extraction
   - Lateral movement detection
+### In Progress 🔄
 - [ ] Recovery Agent (Week 4, Days 1-2)
   - Vulnerability patching
   - Secret rotation

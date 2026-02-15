@@ -174,5 +174,62 @@ Provide your analysis in the specified JSON format."""
             "summary": "Analysis incomplete due to parsing error"
         }
 
+    async def analyze_incident_root_cause(self, incident: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Specialized root cause analysis for Investigation Agent."""
+
+        system_prompt = """You are a forensic security analyst performing root cause analysis. Given comprehensive incident data and forensic evidence, determine:
+
+1. Root cause and attack vector
+2. How the attack succeeded
+3. What should be done to prevent recurrence
+4. Assessment of attacker sophistication
+
+Respond in this exact JSON format:
+{
+    "summary": "Concise description of what happened",
+    "attack_vector": "How the attack was executed",
+    "root_cause": "Underlying vulnerability or weakness",
+    "confidence": 0.0-1.0,
+    "attacker_sophistication": "Low|Medium|High",
+    "impact_assessment": "Description of impact",
+    "recommendations": [
+        "Specific preventive measures",
+        "Security improvements needed"
+    ]
+}"""
+
+        prompt = f"""Perform root cause analysis on this security incident:
+
+INCIDENT DETAILS:
+- ID: {incident.get('incident_id')}
+- Type: {incident.get('type')}
+- Resource: {incident.get('resource')}
+
+FORENSIC ANALYSIS CONTEXT:
+{context}
+
+Provide detailed root cause analysis in the specified JSON format."""
+
+        response = await self.generate(prompt, system_prompt)
+
+        # Parse JSON from response
+        import json
+        try:
+            start = response.find('{')
+            end = response.rfind('}') + 1
+            if start != -1 and end > start:
+                return json.loads(response[start:end])
+        except json.JSONDecodeError:
+            log.error("Failed to parse root cause analysis", response=response[:200])
+
+        # Fallback
+        return {
+            "summary": f"Root cause analysis for incident {incident.get('incident_id', 'unknown')}",
+            "attack_vector": "Analysis pending",
+            "root_cause": "Investigation in progress",
+            "confidence": 0.7,
+            "recommendations": ["Review forensic evidence", "Monitor for similar attacks"]
+        }
+
 # Singleton
 llm_client = LLMClient()
