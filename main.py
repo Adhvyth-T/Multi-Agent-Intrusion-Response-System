@@ -7,6 +7,8 @@ import asyncio
 import signal
 import sys
 import platform
+import agents
+from collectors import forensic_collector
 import structlog
 import os
 
@@ -35,7 +37,7 @@ async def main():
     )
     from collectors import CollectorFactory
     from config import config
-    
+    from agents.investigation import set_global_forensic_collector
     log.info("="*60)
     log.info("🚀 Autonomous Incident Response System")
     log.info("="*60)
@@ -105,6 +107,7 @@ async def main():
         log.info(f"✨ Investigation Collectors: {len(collector) - 1} ready")
         log.info("="*60)
         
+
         # Show collector capabilities
         capabilities = security_collector.get_capabilities()
         log.info("Collector Capabilities:")
@@ -130,6 +133,12 @@ async def main():
     agents.append(asyncio.create_task(security_collector.start(), name="event_collector"))
     log.info(f"✓ Event Collector started ({security_collector.name})")
     
+    #Start Investigation Collectors 
+    forensic_collector = collector['forensic_collector']  # Get from collector dict
+    agents.append(asyncio.create_task(forensic_collector.start(), name="forensic_collector"))
+    set_global_forensic_collector(forensic_collector)
+    log.info("✓ Global Forensic Collector registered for live snapshot sharing")
+
     # Start Communication Agent (handles all notifications)
     agents.append(asyncio.create_task(communication_agent.start(), name="communication"))
     log.info("✓ Communication Agent started")

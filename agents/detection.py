@@ -1,6 +1,7 @@
-# agents/detection.py (COMPLETE WITH DEDUPLICATION)
+# agents/detection.py (UPDATED WITH EARLY FORENSIC TRIGGER)
 """
-Detection Agent - Now using specialized ML models per attack type.
+Detection Agent - Now captures LIVE forensic evidence immediately upon detection.
+This ensures rich forensic data is collected while the attack is still active.
 """
 
 import asyncio
@@ -223,7 +224,7 @@ class DetectionAgent:
     async def start(self):
         """Start the detection agent."""
         self.running = True
-        log.info("Detection Agent started with ML models + deduplication")
+        log.info("Detection Agent started with ML models + deduplication + early forensics")
         await self._event_loop()
     
     async def stop(self):
@@ -298,7 +299,7 @@ class DetectionAgent:
                 detection['confidence'],
                 [f"ML Detection: {detection['detector']} (confidence: {detection['confidence']:.2f})"]
             )
-            
+              
             # Register for deduplication
             self.deduplicator.register_incident(
                 resource=event.resource,
@@ -307,7 +308,23 @@ class DetectionAgent:
                 incident_id=incident.id
             )
             
-            # Push to triage queue
+            # 🚨 IMMEDIATE FORENSIC CAPTURE - While attack is still active!
+            log.info("Triggering immediate forensic capture", 
+                    incident_id=incident.id,
+                    threat_type=detection['threat_type'])
+            
+            await queue.push("forensic_snapshot", {
+                "incident_id": incident.id,
+                "resource": incident.resource,
+                "threat_type": detection['threat_type'],
+                "priority": "immediate",
+                "reason": "live_attack_capture",
+                "severity": incident.severity.value,
+                "confidence": detection['confidence'],
+                "detector": detection['detector']
+            })
+            
+            # Push to triage queue (parallel processing)
             await queue.push("triage", incident.model_dump(mode='json'))
             
             # Send notification
@@ -317,10 +334,11 @@ class DetectionAgent:
                 "severity": incident.severity.value,
                 "threat_type": detection['threat_type'],
                 "resource": incident.resource,
-                "summary": f"ML Detection: {detection['threat_type']} (confidence: {detection['confidence']:.0%})"
+                "summary": f"ML Detection: {detection['threat_type']} (confidence: {detection['confidence']:.0%}) - Live forensics triggered",
+                "forensic_capture": True
             })
             
-            log.info("New incident created",
+            log.info("New incident created with live forensic capture",
                      incident_id=incident.id,
                      threat_type=detection['threat_type'],
                      confidence=detection['confidence'],
@@ -346,7 +364,8 @@ class DetectionAgent:
                 "event": event.raw,
                 "detection_confidence": confidence,
                 "detection_reasons": reasons,
-                "ml_detection": True
+                "ml_detection": True,
+                "forensic_triggered": True  # Mark that forensics were triggered
             }
         )
         
@@ -362,5 +381,3 @@ class DetectionAgent:
 
 # Agent instance
 detection_agent = DetectionAgent(dedup_cooldown_minutes=5)
-
-

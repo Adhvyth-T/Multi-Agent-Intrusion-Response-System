@@ -1,7 +1,7 @@
-# collectors/forensic_collector.py
+# collectors/forensic_collector.py (UPDATED WITH LIVE SNAPSHOT CAPABILITY)
 """
-Forensic Collector - Collect forensic artifacts and evidence for Investigation Agent.
-Specialized collector for post-incident analysis and evidence preservation.
+Forensic Collector - Now captures LIVE attack data immediately when triggered by Detection Agent.
+This ensures rich forensic evidence is collected while the attack is still active.
 """
 
 import asyncio
@@ -47,17 +47,14 @@ class ForensicArtifact:
 
 class ForensicCollector(BaseEventCollector):
     """
-    Collect forensic artifacts for incident investigation.
+    Enhanced Forensic Collector with LIVE ATTACK CAPTURE capability.
     
-    Capabilities:
-    - Memory dumps (if tools available)
-    - Process forensics (command lines, environment, handles)
-    - Network connection snapshots
-    - File system artifacts
-    - Log collection and preservation
-    - Timeline reconstruction
-    - Evidence packaging
-    - Chain of custody tracking
+    NEW CAPABILITIES:
+    - Listens to forensic_snapshot queue for immediate capture
+    - Captures live attack data while malicious processes are active
+    - Stores snapshots for Investigation Agent retrieval
+    - Timeline reconstruction with live attack data
+    - Evidence packaging with chain of custody
     """
     
     def __init__(self, evidence_dir: Optional[str] = None):
@@ -66,22 +63,27 @@ class ForensicCollector(BaseEventCollector):
         self.evidence_dir = Path(evidence_dir) if evidence_dir else Path(tempfile.gettempdir()) / "ir_evidence"
         self.artifacts: List[ForensicArtifact] = []
         self.collection_tasks = []
+        self.live_snapshots: Dict[str, Dict[str, Any]] = {}  # Store snapshots by incident_id
         
         # Ensure evidence directory exists
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
     
     async def start(self) -> None:
-        """Start forensic collection (passive mode)."""
+        """Start forensic collection with queue listening."""
         self.running = True
         self.start_time = datetime.utcnow()
         
-        self.log.info("Forensic collector started in passive mode",
+        self.log.info("Forensic collector started with live snapshot capability",
                      evidence_dir=str(self.evidence_dir))
         
-        # Run periodic cleanup
-        while self.running:
-            await self._cleanup_old_artifacts()
-            await asyncio.sleep(3600)  # Cleanup every hour
+        # Start queue processing for immediate snapshots
+        snapshot_task = asyncio.create_task(self._forensic_snapshot_loop())
+        cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        
+        self.collection_tasks.extend([snapshot_task, cleanup_task])
+        
+        # Wait for completion
+        await asyncio.gather(*self.collection_tasks, return_exceptions=True)
     
     async def stop(self) -> None:
         """Stop forensic collection."""
@@ -97,77 +99,444 @@ class ForensicCollector(BaseEventCollector):
         
         self.log.info("Forensic collector stopped")
     
-    async def health_check(self) -> CollectorHealth:
-        """Check collector health."""
-        if not self.running:
-            return CollectorHealth(
-                status="unhealthy",
-                message="Collector not running",
-                details={}
-            )
+    async def _forensic_snapshot_loop(self):
+        """Process forensic_snapshot queue for immediate live capture."""
+        self.log.info("Starting forensic snapshot queue processing")
+        
+        while self.running:
+            try:
+                snapshot_request = await queue.pop("forensic_snapshot", timeout=5)
+                
+                if snapshot_request:
+                    # Process in background to avoid blocking queue
+                    task = asyncio.create_task(self._process_live_snapshot(snapshot_request))
+                    self.collection_tasks.append(task)
+                    
+            except Exception as e:
+                self.log.error("Error in forensic snapshot loop", error=str(e))
+                await asyncio.sleep(1)
+    
+    async def _process_live_snapshot(self, request: Dict[str, Any]):
+        """Process immediate live snapshot capture."""
+        incident_id = request.get("incident_id")
+        resource = request.get("resource")
+        threat_type = request.get("threat_type")
+        
+        self.log.info("🔬 LIVE FORENSIC CAPTURE started", 
+                     incident_id=incident_id,
+                     threat_type=threat_type,
+                     resource=resource)
+        
+        capture_start = datetime.utcnow()
         
         try:
-            # Check evidence directory accessibility
-            if not self.evidence_dir.exists():
-                return CollectorHealth(
-                    status="unhealthy",
-                    message="Evidence directory not accessible",
-                    details={"evidence_dir": str(self.evidence_dir)}
-                )
+            # Create live snapshot directory
+            snapshot_dir = self.evidence_dir / f"live_snapshot_{incident_id}_{capture_start.strftime('%Y%m%d_%H%M%S')}"
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
             
-            # Check disk space
-            disk_usage = psutil.disk_usage(str(self.evidence_dir))
-            free_gb = disk_usage.free / (1024**3)
-            
-            if free_gb < 1.0:  # Less than 1GB free
-                return CollectorHealth(
-                    status="degraded",
-                    message="Low disk space for evidence collection",
-                    details={"free_gb": round(free_gb, 2)}
-                )
-            
-            return CollectorHealth(
-                status="healthy",
-                message="Forensic collector ready",
-                details={
-                    "evidence_dir": str(self.evidence_dir),
-                    "artifacts_collected": len(self.artifacts),
-                    "free_space_gb": round(free_gb, 2)
-                }
+            # Capture live attack data immediately
+            live_snapshot = await self._capture_live_attack_data(
+                incident_id, resource, threat_type, snapshot_dir
             )
+            
+            # Store for Investigation Agent retrieval
+            self.live_snapshots[incident_id] = {
+                **live_snapshot,
+                "capture_type": "live_attack",
+                "capture_time": capture_start.isoformat(),
+                "snapshot_dir": str(snapshot_dir)
+            }
+            
+            self.log.info("🔬 LIVE FORENSIC CAPTURE completed", 
+                         incident_id=incident_id,
+                         artifacts=len(live_snapshot.get("artifacts", [])),
+                         duration_seconds=(datetime.utcnow() - capture_start).total_seconds())
+            
+            # Notify that live snapshot is ready
+            await queue.push("notification", {
+                "type": "live_forensics_captured",
+                "incident_id": incident_id,
+                "threat_type": threat_type,
+                "artifacts": len(live_snapshot.get("artifacts", [])),
+                "summary": f"Live forensic snapshot captured for {threat_type} attack"
+            })
         
         except Exception as e:
-            self._increment_errors()
-            return CollectorHealth(
-                status="unhealthy",
-                message=f"Health check failed: {str(e)}",
-                details={"error": str(e)}
-            )
+            self.log.error("Live forensic capture failed", 
+                          incident_id=incident_id,
+                          error=str(e))
+            
+            # Store error info
+            self.live_snapshots[incident_id] = {
+                "status": "failed",
+                "error": str(e),
+                "capture_time": capture_start.isoformat()
+            }
     
-    def get_capabilities(self) -> Dict[str, bool]:
-        """Return collector capabilities."""
-        return {
-            "process_monitoring": False,
-            "network_monitoring": False,
-            "file_monitoring": False,
-            "syscall_monitoring": False,
-            "memory_forensics": True,  # If tools available
-            "process_forensics": True,
-            "network_forensics": True,
-            "file_forensics": True,
-            "log_preservation": True,
-            "timeline_reconstruction": True,
-            "evidence_packaging": True
+    async def _capture_live_attack_data(self, incident_id: str, resource: str, 
+                                      threat_type: str, output_dir: Path) -> Dict[str, Any]:
+        """Capture live attack data while processes are active."""
+        
+        # Live snapshot manifest
+        manifest = {
+            "incident_id": incident_id,
+            "resource": resource,
+            "threat_type": threat_type,
+            "capture_start": datetime.utcnow().isoformat(),
+            "capture_type": "live_attack_snapshot",
+            "hostname": platform.node(),
+            "platform": platform.system(),
+            "artifacts": []
         }
+        
+        # Capture tasks - run concurrently for speed
+        capture_tasks = [
+            self._capture_live_processes(output_dir),
+            self._capture_live_network(output_dir),
+            self._capture_live_system_state(output_dir),
+            self._capture_container_state(output_dir, resource)
+        ]
+        
+        results = await asyncio.gather(*capture_tasks, return_exceptions=True)
+        
+        # Collect artifacts from results
+        for result in results:
+            if isinstance(result, list):
+                manifest["artifacts"].extend(result)
+            elif isinstance(result, Exception):
+                self.log.error("Live capture error", error=str(result))
+        
+        manifest["capture_end"] = datetime.utcnow().isoformat()
+        manifest["total_artifacts"] = len(manifest["artifacts"])
+        
+        # Save live manifest
+        manifest_path = output_dir / "live_capture_manifest.json"
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+        
+        return manifest
+    
+    async def _capture_live_processes(self, output_dir: Path) -> List[Dict[str, Any]]:
+        """Capture live process data with active connections."""
+        self.log.info("Capturing live processes")
+        artifacts = []
+        
+        try:
+            process_path = output_dir / "live_processes.json"
+            processes = []
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'exe', 'cwd', 
+                                           'username', 'create_time', 'cpu_times', 
+                                           'memory_info', 'open_files']):
+                try:
+                    pinfo = proc.info
+                    
+                    # Get live connections for this process
+                    try:
+                        pinfo['connections'] = [
+                            {
+                                'fd': conn.fd,
+                                'family': str(conn.family),
+                                'type': str(conn.type),
+                                'laddr': f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else None,
+                                'raddr': f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else None,
+                                'status': conn.status
+                            }
+                            for conn in proc.connections()
+                        ]
+                    except:
+                        pinfo['connections'] = []
+                    
+                    # Get open files
+                    try:
+                        pinfo['open_files'] = [f.path for f in proc.open_files()]
+                    except:
+                        pinfo['open_files'] = []
+                    
+                    # Mark if this is a suspicious process
+                    if pinfo.get('cmdline'):
+                        cmdline = ' '.join(pinfo['cmdline']).lower()
+                        pinfo['suspicious'] = any(pattern in cmdline for pattern in [
+                            'xmrig', 'minerd', 'cryptonight', 'stratum+tcp',
+                            'bash -i', 'nc -e', '/dev/tcp/', 'python -c',
+                            'while true', 'curl', 'wget'
+                        ])
+                    
+                    # Convert datetime
+                    if pinfo['create_time']:
+                        pinfo['create_time'] = datetime.fromtimestamp(pinfo['create_time']).isoformat()
+                    
+                    processes.append(pinfo)
+                
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            
+            with open(process_path, 'w') as f:
+                json.dump(processes, f, indent=2, default=str)
+            
+            artifacts.append({
+                "type": "live_process_snapshot",
+                "name": "live_processes.json",
+                "path": str(process_path),
+                "size": process_path.stat().st_size,
+                "description": "Live process snapshot with active connections"
+            })
+        
+        except Exception as e:
+            self.log.error("Live process capture error", error=str(e))
+        
+        return artifacts
+    
+    async def _capture_live_network(self, output_dir: Path) -> List[Dict[str, Any]]:
+        """Capture live network connections and traffic."""
+        self.log.info("Capturing live network state")
+        artifacts = []
+        
+        try:
+            # Active connections with more detail
+            netstat_path = output_dir / "live_netstat.txt"
+            cmd = ['netstat', '-antup'] if not self.is_windows else ['netstat', '-ano']
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                with open(netstat_path, 'w') as f:
+                    f.write(f"# LIVE network connections captured at {datetime.utcnow().isoformat()}\n")
+                    f.write(result.stdout)
+                
+                artifacts.append({
+                    "type": "live_network_connections",
+                    "name": "live_netstat.txt",
+                    "path": str(netstat_path),
+                    "size": netstat_path.stat().st_size,
+                    "description": "Live network connections during attack"
+                })
+            
+            # Live connection summary with psutil (more detailed)
+            connections_path = output_dir / "live_connections.json"
+            connections = []
+            
+            for conn in psutil.net_connections(kind='inet'):
+                try:
+                    conn_info = {
+                        'family': str(conn.family),
+                        'type': str(conn.type),
+                        'laddr': f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else None,
+                        'raddr': f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else None,
+                        'status': conn.status,
+                        'pid': conn.pid
+                    }
+                    
+                    # Get process name for this connection
+                    if conn.pid:
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            conn_info['process_name'] = proc.name()
+                            conn_info['cmdline'] = proc.cmdline()
+                        except:
+                            pass
+                    
+                    connections.append(conn_info)
+                
+                except Exception:
+                    continue
+            
+            with open(connections_path, 'w') as f:
+                json.dump(connections, f, indent=2, default=str)
+            
+            artifacts.append({
+                "type": "live_connection_details",
+                "name": "live_connections.json", 
+                "path": str(connections_path),
+                "size": connections_path.stat().st_size,
+                "description": "Detailed live connections with process mapping"
+            })
+        
+        except Exception as e:
+            self.log.error("Live network capture error", error=str(e))
+        
+        return artifacts
+    
+    async def _capture_live_system_state(self, output_dir: Path) -> List[Dict[str, Any]]:
+        """Capture live system state during attack."""
+        self.log.info("Capturing live system state")
+        artifacts = []
+        
+        try:
+            sysinfo_path = output_dir / "live_system_state.json"
+            
+            # Enhanced system info with live metrics
+            sysinfo = {
+                "hostname": platform.node(),
+                "platform": platform.system(),
+                "capture_time": datetime.utcnow().isoformat(),
+                "uptime": datetime.fromtimestamp(psutil.boot_time()).isoformat(),
+                "users": [u._asdict() for u in psutil.users()],
+                
+                # Live resource usage
+                "cpu": {
+                    "percent": psutil.cpu_percent(interval=1),  # 1 second sample
+                    "count": psutil.cpu_count(),
+                    "times": psutil.cpu_times()._asdict()
+                },
+                
+                "memory": psutil.virtual_memory()._asdict(),
+                "swap": psutil.swap_memory()._asdict(),
+                
+                # Disk I/O (might show exfiltration)
+                "disk_io": psutil.disk_io_counters()._asdict() if psutil.disk_io_counters() else {},
+                
+                # Network I/O (shows communication)
+                "network_io": psutil.net_io_counters()._asdict(),
+                
+                # Load average (Unix)
+                "load_avg": psutil.getloadavg() if hasattr(psutil, 'getloadavg') else None
+            }
+            
+            with open(sysinfo_path, 'w') as f:
+                json.dump(sysinfo, f, indent=2, default=str)
+            
+            artifacts.append({
+                "type": "live_system_state",
+                "name": "live_system_state.json",
+                "path": str(sysinfo_path),
+                "size": sysinfo_path.stat().st_size,
+                "description": "Live system resource usage during attack"
+            })
+        
+        except Exception as e:
+            self.log.error("Live system state error", error=str(e))
+        
+        return artifacts
+    
+    async def _capture_container_state(self, output_dir: Path, resource: str) -> List[Dict[str, Any]]:
+        """Capture container-specific state if applicable."""
+        if not resource or "container" not in resource.lower():
+            return []
+        
+        self.log.info("Capturing container state", resource=resource)
+        artifacts = []
+        
+        try:
+            # Extract container name
+            container_name = resource.split('/')[-1] if '/' in resource else resource
+            
+            # Docker container inspection
+            inspect_path = output_dir / "container_inspect.json"
+            result = subprocess.run([
+                'docker', 'inspect', container_name
+            ], capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                with open(inspect_path, 'w') as f:
+                    f.write(result.stdout)
+                
+                artifacts.append({
+                    "type": "container_inspection",
+                    "name": "container_inspect.json",
+                    "path": str(inspect_path),
+                    "size": inspect_path.stat().st_size,
+                    "description": f"Docker inspection of {container_name}"
+                })
+            
+            # Container processes
+            top_path = output_dir / "container_processes.txt"
+            result = subprocess.run([
+                'docker', 'top', container_name
+            ], capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                with open(top_path, 'w') as f:
+                    f.write(f"# Live processes in {container_name} at {datetime.utcnow().isoformat()}\n")
+                    f.write(result.stdout)
+                
+                artifacts.append({
+                    "type": "container_processes",
+                    "name": "container_processes.txt",
+                    "path": str(top_path),
+                    "size": top_path.stat().st_size,
+                    "description": f"Live processes in container {container_name}"
+                })
+        
+        except Exception as e:
+            self.log.error("Container capture error", error=str(e))
+        
+        return artifacts
+    
+    async def _periodic_cleanup(self):
+        """Periodic cleanup task."""
+        while self.running:
+            await asyncio.sleep(3600)  # Every hour
+            await self._cleanup_old_artifacts()
+    
+    # ================================================================
+    # INVESTIGATION AGENT INTERFACE
+    # ================================================================
+    
+    async def get_live_snapshot(self, incident_id: str) -> Optional[Dict[str, Any]]:
+        """Get live snapshot data for Investigation Agent."""
+        return self.live_snapshots.get(incident_id)
     
     async def collect_incident_forensics(self, incident_id: str, 
                                        resource: str = None) -> Dict[str, Any]:
         """
-        Main forensic collection for an incident.
+        Enhanced forensic collection that uses live snapshot if available.
         Called by Investigation Agent.
         """
-        self.log.info("Starting forensic collection", incident_id=incident_id)
+        self.log.info("Collecting forensics for investigation", incident_id=incident_id)
         
+        # Check for existing live snapshot first
+        live_snapshot = self.live_snapshots.get(incident_id)
+        if live_snapshot and live_snapshot.get("status") != "failed":
+            self.log.info("Using existing live snapshot", incident_id=incident_id)
+            
+            # Enhance live snapshot with additional post-incident data
+            enhanced_snapshot = await self._enhance_live_snapshot(incident_id, live_snapshot, resource)
+            return enhanced_snapshot
+        
+        # Fallback: Standard post-incident collection
+        self.log.info("No live snapshot found, performing standard collection", incident_id=incident_id)
+        return await self._standard_forensic_collection(incident_id, resource)
+    
+    async def _enhance_live_snapshot(self, incident_id: str, live_snapshot: Dict[str, Any], 
+                                   resource: str) -> Dict[str, Any]:
+        """Enhance live snapshot with post-incident data."""
+        
+        enhanced = {
+            **live_snapshot,
+            "enhancement_start": datetime.utcnow().isoformat(),
+            "has_live_data": True,
+
+            # FORMAT FOR IOC EXTRACTION - This is the key fix!
+            "manifest": live_snapshot,  # IOC extractor looks for 'manifest'
+            "artifacts": live_snapshot.get("artifacts", []),  # Ensure 'artifacts' key exists
+            "artifacts_collected": len(live_snapshot.get("artifacts", [])),
+        
+            # Live data quality indicators
+            "data_quality": "excellent",
+            "capture_type": "live_attack_enhanced"
+            }
+        
+        try:
+            # Add post-incident logs
+            snapshot_dir = Path(live_snapshot["snapshot_dir"])
+            post_logs = await self._collect_logs(snapshot_dir / "post_incident", incident_id)
+            
+            enhanced["artifacts"].extend(post_logs)
+            enhanced["post_incident_artifacts"] = len(post_logs)
+            enhanced["enhancement_end"] = datetime.utcnow().isoformat()
+            
+            self.log.info("Live snapshot enhanced", 
+                         incident_id=incident_id,
+                         additional_artifacts=len(post_logs))
+        
+        except Exception as e:
+            self.log.error("Snapshot enhancement failed", error=str(e))
+            enhanced["enhancement_error"] = str(e)
+        
+        return enhanced
+    
+    async def _standard_forensic_collection(self, incident_id: str, resource: str) -> Dict[str, Any]:
+        """Standard post-incident forensic collection (fallback)."""
         collection_start = datetime.utcnow()
         incident_dir = self.evidence_dir / f"incident_{incident_id}_{collection_start.strftime('%Y%m%d_%H%M%S')}"
         incident_dir.mkdir(parents=True, exist_ok=True)
@@ -176,7 +545,8 @@ class ForensicCollector(BaseEventCollector):
         manifest = {
             "incident_id": incident_id,
             "collection_start": collection_start.isoformat(),
-            "collector_version": "1.0",
+            "collection_type": "post_incident",
+            "has_live_data": False,
             "hostname": platform.node(),
             "platform": platform.system(),
             "resource": resource,
@@ -184,7 +554,7 @@ class ForensicCollector(BaseEventCollector):
         }
         
         try:
-            # Collect different types of forensic evidence
+            # Standard collection tasks
             tasks = [
                 self._collect_process_forensics(incident_dir, incident_id),
                 self._collect_network_forensics(incident_dir, incident_id),
@@ -193,10 +563,9 @@ class ForensicCollector(BaseEventCollector):
                 self._collect_logs(incident_dir, incident_id),
             ]
             
-            # Run collections concurrently
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Collect artifacts from results
+            # Collect artifacts
             for result in results:
                 if isinstance(result, list):
                     manifest["artifacts"].extend(result)
@@ -211,32 +580,95 @@ class ForensicCollector(BaseEventCollector):
             with open(manifest_path, 'w') as f:
                 json.dump(manifest, f, indent=2)
             
-            # Create evidence package
-            package_path = await self._create_evidence_package(incident_dir)
-            
-            self.log.info("Forensic collection completed",
-                         incident_id=incident_id,
-                         artifacts=len(manifest["artifacts"]),
-                         package=str(package_path))
-            
             return {
                 "status": "completed",
                 "incident_id": incident_id,
                 "artifacts_collected": len(manifest["artifacts"]),
-                "evidence_package": str(package_path),
                 "collection_time": (datetime.utcnow() - collection_start).total_seconds(),
-                "manifest": manifest
+                "manifest": manifest,
+                "has_live_data": False
             }
         
         except Exception as e:
-            self.log.error("Forensic collection failed", 
-                          incident_id=incident_id, error=str(e))
-            self._increment_errors()
+            self.log.error("Standard forensic collection failed", error=str(e))
             return {
                 "status": "failed",
                 "incident_id": incident_id,
-                "error": str(e)
+                "error": str(e),
+                "has_live_data": False
             }
+    
+    # ================================================================
+    # EXISTING METHODS (kept for compatibility)
+    # ================================================================
+    
+    async def health_check(self) -> CollectorHealth:
+        """Check collector health."""
+        if not self.running:
+            return CollectorHealth(
+                status="unhealthy",
+                message="Collector not running",
+                details={}
+            )
+        
+        try:
+            # Check evidence directory
+            if not self.evidence_dir.exists():
+                return CollectorHealth(
+                    status="unhealthy",
+                    message="Evidence directory not accessible",
+                    details={"evidence_dir": str(self.evidence_dir)}
+                )
+            
+            # Check disk space
+            disk_usage = psutil.disk_usage(str(self.evidence_dir))
+            free_gb = disk_usage.free / (1024**3)
+            
+            if free_gb < 1.0:
+                return CollectorHealth(
+                    status="degraded",
+                    message="Low disk space for evidence collection",
+                    details={"free_gb": round(free_gb, 2)}
+                )
+            
+            return CollectorHealth(
+                status="healthy",
+                message="Forensic collector ready with live capture",
+                details={
+                    "evidence_dir": str(self.evidence_dir),
+                    "live_snapshots": len(self.live_snapshots),
+                    "free_space_gb": round(free_gb, 2)
+                }
+            )
+        
+        except Exception as e:
+            self._increment_errors()
+            return CollectorHealth(
+                status="unhealthy",
+                message=f"Health check failed: {str(e)}",
+                details={"error": str(e)}
+            )
+    
+    def get_capabilities(self) -> Dict[str, bool]:
+        """Return enhanced collector capabilities."""
+        return {
+            "process_monitoring": False,
+            "network_monitoring": False,
+            "file_monitoring": False,
+            "syscall_monitoring": False,
+            "live_attack_capture": True,  # NEW
+            "memory_forensics": True,
+            "process_forensics": True,
+            "network_forensics": True,
+            "file_forensics": True,
+            "log_preservation": True,
+            "timeline_reconstruction": True,
+            "evidence_packaging": True
+        }
+    
+    # ================================================================
+    # STANDARD FORENSIC COLLECTION METHODS (from original file)
+    # ================================================================
     
     async def _collect_process_forensics(self, output_dir: Path, incident_id: str) -> List[Dict[str, Any]]:
         """Collect process-related forensic artifacts."""
@@ -253,28 +685,8 @@ class ForensicCollector(BaseEventCollector):
                                            'memory_info', 'open_files']):
                 try:
                     pinfo = proc.info
-
-                    try:
-                         pinfo['connections'] = [
-                                {
-                                    'fd': conn.fd,
-                                    'family': str(conn.family),
-                                    'type': str(conn.type),
-                                    'laddr': f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else None,
-                                    'raddr': f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else None,
-                                    'status': conn.status
-                                }
-                                for conn in proc.connections()  # ← This is the correct way
-                            ]
-                    except:
-                        pinfo['connections'] = []
                     
-                    # Get additional process details
-                    try:
-                        pinfo['open_files'] = [f.path for f in proc.open_files()]
-                    except:
-                        pinfo['open_files'] = []
-                    
+                    # Get connections separately (fixed version)
                     try:
                         pinfo['connections'] = [
                             {
@@ -289,6 +701,12 @@ class ForensicCollector(BaseEventCollector):
                         ]
                     except:
                         pinfo['connections'] = []
+                    
+                    # Get open files
+                    try:
+                        pinfo['open_files'] = [f.path for f in proc.open_files()]
+                    except:
+                        pinfo['open_files'] = []
                     
                     # Convert datetime objects
                     if pinfo['create_time']:

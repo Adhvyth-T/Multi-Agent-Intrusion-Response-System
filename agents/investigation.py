@@ -1,14 +1,13 @@
-# agents/investigation.py
+# agents/investigation.py (UPDATED WITH LIVE SNAPSHOT INTEGRATION)
 """
-Investigation Agent - Week 3, Days 6-7
-Forensic analysis, root cause identification, IOC extraction, lateral movement detection.
-
-Integrates with the comprehensive collector system for complete investigation capabilities.
+Investigation Agent - Now uses LIVE forensic snapshots when available.
+This provides rich attack data captured while the threat was active.
 """
 
 import asyncio
 import json
 import uuid
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 import structlog
@@ -19,6 +18,18 @@ from collectors import CollectorManager, CollectorFactory, ForensicCollector, Lo
 from config import config
 
 log = structlog.get_logger()
+
+# Global forensic collector registry for sharing between agents
+_GLOBAL_FORENSIC_COLLECTOR = None
+
+def set_global_forensic_collector(collector):
+    """Set the global forensic collector instance."""
+    global _GLOBAL_FORENSIC_COLLECTOR
+    _GLOBAL_FORENSIC_COLLECTOR = collector
+
+def get_global_forensic_collector():
+    """Get the global forensic collector instance."""
+    return _GLOBAL_FORENSIC_COLLECTOR
 
 
 class IOCExtractor:
@@ -152,13 +163,27 @@ class IOCExtractor:
             manifest_iocs = self.extract_from_text(manifest_text)
             self._merge_iocs(all_iocs, manifest_iocs)
         
-        # Extract from artifacts
+        # Extract from artifacts - NOW READS FILE CONTENTS!
         artifacts = forensic_data.get('artifacts', [])
         for artifact in artifacts:
             if isinstance(artifact, dict):
+                # Extract IOCs from artifact metadata
                 artifact_text = json.dumps(artifact)
                 artifact_iocs = self.extract_from_text(artifact_text)
                 self._merge_iocs(all_iocs, artifact_iocs)
+                
+                # NEW: Extract IOCs from actual file contents
+                file_path = artifact.get('path')
+                if file_path and os.path.exists(file_path):
+                    try:
+                        # Read file content based on type
+                        file_content = self._read_artifact_file(file_path, artifact.get('type', ''))
+                        if file_content:
+                            file_iocs = self.extract_from_text(file_content)
+                            self._merge_iocs(all_iocs, file_iocs)
+                    except Exception as e:
+                        # Log error but continue processing other artifacts
+                        pass
         
         # Convert sets back to lists
         result = {
@@ -175,6 +200,44 @@ class IOCExtractor:
         }
         
         return result
+    
+    def _read_artifact_file(self, file_path: str, artifact_type: str) -> str:
+        """Read artifact file content for IOC extraction."""
+        try:
+            # Different handling based on file type
+            if artifact_type in ['live_process_snapshot', 'process_snapshot', 
+                               'live_connection_details', 'live_system_state',
+                               'container_inspection', 'system_info']:
+                # JSON files - read and extract
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                return content
+                
+            elif artifact_type in ['live_network_connections', 'network_connections',
+                                 'container_processes', 'process_tree']:
+                # Text files - read directly
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                return content
+                
+            elif 'log' in artifact_type.lower():
+                # Log files - read with size limit
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read(50000)  # Read first 50KB
+                return content
+                
+            else:
+                # Try to read as text with fallback
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read(10000)  # Read first 10KB
+                    return content
+                except UnicodeDecodeError:
+                    # Skip binary files
+                    return ""
+                    
+        except Exception as e:
+            return ""
     
     def _merge_iocs(self, target: Dict, source: Dict):
         """Merge IOCs from source into target."""
@@ -198,18 +261,27 @@ class TimelineReconstructor:
         manifest = forensic_data.get('manifest', {})
         
         # Collection timestamps
-        if manifest.get('collection_start'):
+        if manifest.get('collection_start') or manifest.get('capture_start'):
+            start_time = manifest.get('capture_start') or manifest.get('collection_start')
+            capture_type = manifest.get('capture_type', 'forensic_collection')
+            
             self.events.append({
-                'timestamp': manifest['collection_start'],
+                'timestamp': start_time,
                 'source': 'forensic_collector',
                 'event_type': 'forensic_collection_started',
-                'description': f"Forensic evidence collection began for incident {manifest.get('incident_id', 'unknown')}",
-                'details': {'artifacts': len(manifest.get('artifacts', []))}
+                'description': f"Forensic evidence collection began for incident {manifest.get('incident_id', 'unknown')} ({capture_type})",
+                'details': {
+                    'artifacts': len(manifest.get('artifacts', [])),
+                    'capture_type': capture_type,
+                    'has_live_data': manifest.get('has_live_data', False)
+                }
             })
         
-        if manifest.get('collection_end'):
+        if manifest.get('collection_end') or manifest.get('capture_end'):
+            end_time = manifest.get('capture_end') or manifest.get('collection_end')
+            
             self.events.append({
-                'timestamp': manifest['collection_end'],
+                'timestamp': end_time,
                 'source': 'forensic_collector',
                 'event_type': 'forensic_collection_completed',
                 'description': f"Forensic evidence collection completed with {len(manifest.get('artifacts', []))} artifacts",
@@ -364,7 +436,7 @@ class LateralMovementAnalyzer:
 
 
 class InvestigationAgent:
-    """Main Investigation Agent that performs comprehensive forensic analysis."""
+    """Enhanced Investigation Agent with live forensic snapshot integration."""
     
     def __init__(self):
         self.running = False
@@ -372,8 +444,9 @@ class InvestigationAgent:
         self.ioc_extractor = IOCExtractor()
         self.investigation_count = 0
         self.success_count = 0
+        self.live_snapshots_used = 0
         
-        log.info("Investigation Agent initialized")
+        log.info("Investigation Agent initialized with live snapshot support")
     
     async def start(self):
         """Start the investigation agent."""
@@ -383,7 +456,7 @@ class InvestigationAgent:
         log.info("Setting up investigation collectors...")
         await self._setup_collectors()
         
-        log.info("Investigation Agent started with comprehensive forensic capabilities")
+        log.info("Investigation Agent started with live forensic integration")
         await self._investigation_loop()
     
     async def stop(self):
@@ -395,14 +468,15 @@ class InvestigationAgent:
         
         log.info("Investigation Agent stopped",
                 total_investigations=self.investigation_count,
-                successful=self.success_count)
+                successful=self.success_count,
+                live_snapshots_used=self.live_snapshots_used)
     
     async def _setup_collectors(self):
         """Set up collectors needed for investigation."""
         try:
-            # Create investigation collectors
+            # Create investigation collectors (EXCEPT forensic - we'll use the background service)
             investigation_collectors = await CollectorFactory.create_investigation_collectors(
-                collectors=['log', 'network', 'host', 'forensic'],
+                collectors=['log', 'network', 'host'],  # Remove 'forensic'
                 evidence_dir="./evidence"
             )
             
@@ -413,7 +487,9 @@ class InvestigationAgent:
             for collector in investigation_collectors:
                 await self.collector_manager.add_collector(collector.name, collector)
             
-            log.info("Investigation collectors ready",
+            # IMPORTANT: We'll get the forensic collector from the global registry
+            # instead of creating a new instance
+            log.info("Investigation collectors ready (using background forensic service)",
                     count=len(investigation_collectors))
             
         except Exception as e:
@@ -445,8 +521,17 @@ class InvestigationAgent:
         investigation_start = datetime.utcnow()
         
         try:
-            # 1. Collect forensic evidence
-            forensic_data = await self._collect_forensic_evidence(incident_id, resource)
+            # 1. Check for live forensic snapshot first (NEW!)
+            forensic_data = await self._get_forensic_evidence(incident_id, resource)
+            has_live_data = forensic_data.get("has_live_data", False)
+            
+            if has_live_data:
+                self.live_snapshots_used += 1
+                log.info("🔬 Using LIVE forensic snapshot", 
+                        incident_id=incident_id,
+                        artifacts=forensic_data.get("artifacts_collected", 0))
+            else:
+                log.info("Using post-incident forensic collection", incident_id=incident_id)
             
             # 2. Analyze logs
             log_analysis = await self._analyze_logs(incident_id, resource)
@@ -462,19 +547,19 @@ class InvestigationAgent:
                 request, forensic_data, log_analysis, network_analysis
             )
             
-            # 6. Extract IOCs
+            # 6. Extract IOCs (enhanced with live data)
             iocs = await self._extract_iocs(forensic_data, log_analysis, network_analysis)
             
             # 7. Analyze lateral movement
             lateral_movement = await self._analyze_lateral_movement(network_analysis, log_analysis)
             
-            # 8. LLM-powered root cause analysis
+            # 8. LLM-powered root cause analysis (with live data context)
             root_cause = await self._perform_root_cause_analysis(
                 request, forensic_data, log_analysis, network_analysis, 
-                timeline, iocs, lateral_movement
+                timeline, iocs, lateral_movement, has_live_data
             )
             
-            # 9. Generate investigation report
+            # 9. Generate enhanced investigation report
             investigation_report = self._generate_investigation_report(
                 incident_id=incident_id,
                 forensic_data=forensic_data,
@@ -485,7 +570,8 @@ class InvestigationAgent:
                 iocs=iocs,
                 lateral_movement=lateral_movement,
                 root_cause=root_cause,
-                duration=(datetime.utcnow() - investigation_start).total_seconds()
+                duration=(datetime.utcnow() - investigation_start).total_seconds(),
+                has_live_data=has_live_data
             )
             
             # 10. Save investigation results
@@ -504,10 +590,11 @@ class InvestigationAgent:
                 "recommendations": root_cause.get("recommendations", []),
                 "iocs": iocs,
                 "timeline": timeline[-5:],  # Last 5 events for context
-                "severity": request.get("severity", "P3")
+                "severity": request.get("severity", "P3"),
+                "has_live_data": has_live_data
             })
             
-            # 13. Send notification
+            # 13. Send enhanced notification
             await queue.push("notification", {
                 "type": "investigation_complete",
                 "incident_id": incident_id,
@@ -516,7 +603,9 @@ class InvestigationAgent:
                 "timeline_events": len(timeline),
                 "root_cause": root_cause.get("summary", "Investigation completed"),
                 "recommendations": len(root_cause.get("recommendations", [])),
-                "duration_seconds": investigation_report["duration_seconds"]
+                "duration_seconds": investigation_report["duration_seconds"],
+                "has_live_data": has_live_data,
+                "data_quality": "excellent" if has_live_data else "good"
             })
             
             self.success_count += 1
@@ -524,7 +613,8 @@ class InvestigationAgent:
                     incident_id=incident_id,
                     duration_seconds=investigation_report["duration_seconds"],
                     iocs_found=len(iocs.get("ips", [])) + len(iocs.get("domains", [])),
-                    timeline_events=len(timeline))
+                    timeline_events=len(timeline),
+                    has_live_data=has_live_data)
             
         except Exception as e:
             log.error("Investigation failed",
@@ -541,30 +631,177 @@ class InvestigationAgent:
                 "summary": f"Investigation failed: {str(e)}"
             })
     
-    async def _collect_forensic_evidence(self, incident_id: str, resource: str) -> Dict[str, Any]:
-        """Collect comprehensive forensic evidence."""
-        log.info("Collecting forensic evidence", incident_id=incident_id)
+    async def _get_forensic_evidence(self, incident_id: str, resource: str) -> Dict[str, Any]:
+        """Get forensic evidence - prioritizing live snapshots from background service."""
+        log.info("Getting forensic evidence", incident_id=incident_id)
         
-        forensic_collector = self.collector_manager.get_collector('forensic_collector')
+        # Get the background forensic collector instance (the one with live snapshots)
+        forensic_collector = get_global_forensic_collector()
+        
         if not forensic_collector:
-            log.warning("Forensic collector not available")
-            return {}
+            log.warning("Background forensic collector not available")
+            return {"has_live_data": False}
         
         try:
+            # This now intelligently uses live snapshot if available
             result = await forensic_collector.collect_incident_forensics(
                 incident_id=incident_id,
                 resource=resource
             )
             
-            log.info("Forensic evidence collected",
+            log.info("Forensic evidence retrieved",
                     incident_id=incident_id,
-                    artifacts=result.get("artifacts_collected", 0))
+                    artifacts=result.get("artifacts_collected", 0),
+                    has_live_data=result.get("has_live_data", False))
             
             return result
         
         except Exception as e:
-            log.error("Forensic collection failed", error=str(e))
-            return {}
+            log.error("Forensic evidence retrieval failed", error=str(e))
+            return {"has_live_data": False, "error": str(e)}
+    
+    async def _perform_root_cause_analysis(self, request: Dict[str, Any],
+                                          forensic_data: Dict[str, Any],
+                                          log_analysis: Dict[str, Any],
+                                          network_analysis: Dict[str, Any],
+                                          timeline: List[Dict[str, Any]],
+                                          iocs: Dict[str, Any],
+                                          lateral_movement: Dict[str, Any],
+                                          has_live_data: bool = False) -> Dict[str, Any]:
+        """Enhanced root cause analysis with live data context."""
+        log.info("Performing root cause analysis", has_live_data=has_live_data)
+        
+        try:
+            # Build comprehensive context for LLM
+            context = {
+                "incident": request,
+                "data_quality": "excellent" if has_live_data else "good",
+                "live_attack_captured": has_live_data,
+                "forensic_summary": {
+                    "artifacts_collected": forensic_data.get("artifacts_collected", 0),
+                    "evidence_package": forensic_data.get("evidence_package", "Not available"),
+                    "has_live_processes": has_live_data,
+                    "has_live_network": has_live_data
+                },
+                "log_summary": {
+                    "total_logs": log_analysis.get("total_logs_analyzed", 0),
+                    "suspicious_patterns": len(log_analysis.get("suspicious_patterns", []))
+                },
+                "network_summary": {
+                    "total_connections": network_analysis.get("total_connections", 0),
+                    "unique_destinations": network_analysis.get("summary", {}).get("unique_destinations", 0)
+                },
+                "timeline_events": len(timeline),
+                "iocs_found": {
+                    "ips": len(iocs.get("ips", [])),
+                    "domains": len(iocs.get("domains", [])),
+                    "commands": len(iocs.get("suspicious_commands", []))
+                },
+                "lateral_movement_risk": lateral_movement.get("overall_risk_score", 0),
+                "key_timeline_events": timeline[-10:] if timeline else [],  # Last 10 events
+                "top_iocs": {
+                    "ips": iocs.get("ips", [])[:5],  # Top 5 IPs
+                    "domains": iocs.get("domains", [])[:5],  # Top 5 domains
+                    "commands": iocs.get("suspicious_commands", [])[:3]  # Top 3 commands
+                }
+            }
+            
+            # Use enhanced LLM analysis with live data context
+            root_cause_analysis = await llm_client.analyze_incident_root_cause(
+                incident=request,
+                context=context
+            )
+            
+            # Enhance analysis based on data quality
+            if has_live_data:
+                root_cause_analysis["data_quality"] = "excellent"
+                root_cause_analysis["analysis_note"] = "Analysis based on live attack data captured during active threat"
+            else:
+                root_cause_analysis["data_quality"] = "limited"
+                root_cause_analysis["analysis_note"] = "Analysis based on post-incident forensic collection"
+            
+            log.info("Root cause analysis completed",
+                    confidence=root_cause_analysis.get("confidence", 0),
+                    has_live_data=has_live_data)
+            
+            return root_cause_analysis
+        
+        except Exception as e:
+            log.error("Root cause analysis failed", error=str(e))
+            
+            # Enhanced fallback analysis
+            return {
+                "summary": f"Automated analysis for incident {request.get('incident_id', 'unknown')}",
+                "attack_vector": "Unknown - Analysis failed",
+                "confidence": 0.5 if has_live_data else 0.3,
+                "data_quality": "excellent" if has_live_data else "limited",
+                "recommendations": [
+                    "Review forensic evidence manually",
+                    "Investigate suspicious IOCs found",
+                    "Monitor for lateral movement indicators"
+                ],
+                "error": str(e),
+                "analysis_note": f"Analysis failed - {'Live' if has_live_data else 'Post-incident'} data available"
+            }
+    
+    def _generate_investigation_report(self, **kwargs) -> Dict[str, Any]:
+        """Generate enhanced investigation report with live data indicators."""
+        report_id = str(uuid.uuid4())[:8]
+        
+        report = {
+            "id": report_id,
+            "incident_id": kwargs["incident_id"],
+            "generated_at": datetime.utcnow().isoformat(),
+            "duration_seconds": kwargs["duration"],
+            "has_live_data": kwargs.get("has_live_data", False),
+            "data_quality": "excellent" if kwargs.get("has_live_data", False) else "good",
+            "forensic_evidence": kwargs["forensic_data"],
+            "log_analysis": kwargs["log_analysis"],
+            "network_analysis": kwargs["network_analysis"],
+            "host_analysis": kwargs["host_analysis"],
+            "timeline": kwargs["timeline"],
+            "iocs": kwargs["iocs"],
+            "lateral_movement": kwargs["lateral_movement"],
+            "root_cause": kwargs["root_cause"],
+            "summary": {
+                "total_artifacts": kwargs["forensic_data"].get("artifacts_collected", 0),
+                "total_logs_analyzed": kwargs["log_analysis"].get("total_logs_analyzed", 0),
+                "total_connections": kwargs["network_analysis"].get("total_connections", 0),
+                "timeline_events": len(kwargs["timeline"]),
+                "total_iocs": (len(kwargs["iocs"].get("ips", [])) + 
+                              len(kwargs["iocs"].get("domains", [])) + 
+                              len(kwargs["iocs"].get("suspicious_commands", []))),
+                "lateral_movement_risk": kwargs["lateral_movement"].get("overall_risk_score", 0),
+                "root_cause_confidence": kwargs["root_cause"].get("confidence", 0.0),
+                "live_attack_captured": kwargs.get("has_live_data", False)
+            }
+        }
+        
+        return report
+    
+    # [Keep all existing helper methods from original file]
+    # _analyze_logs, _analyze_network_activity, _analyze_host_state, 
+    # _reconstruct_timeline, _extract_iocs, _analyze_lateral_movement, etc.
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get enhanced investigation agent statistics."""
+        return {
+            "total_investigations": self.investigation_count,
+            "successful_investigations": self.success_count,
+            "live_snapshots_used": self.live_snapshots_used,
+            "live_snapshot_usage_rate": (
+                self.live_snapshots_used / self.investigation_count 
+                if self.investigation_count > 0 else 0
+            ),
+            "success_rate": (
+                self.success_count / self.investigation_count 
+                if self.investigation_count > 0 else 0
+            ),
+            "collectors_available": self.collector_manager.list_collectors() if self.collector_manager else []
+        }
+    
+    # Include all other existing methods from the original investigation.py file...
+    # (keeping them the same for compatibility)
     
     async def _analyze_logs(self, incident_id: str, resource: str) -> Dict[str, Any]:
         """Analyze logs for suspicious patterns."""
@@ -781,106 +1018,6 @@ class InvestigationAgent:
         
         return lateral_analysis
     
-    async def _perform_root_cause_analysis(self, request: Dict[str, Any],
-                                          forensic_data: Dict[str, Any],
-                                          log_analysis: Dict[str, Any],
-                                          network_analysis: Dict[str, Any],
-                                          timeline: List[Dict[str, Any]],
-                                          iocs: Dict[str, Any],
-                                          lateral_movement: Dict[str, Any]) -> Dict[str, Any]:
-        """Perform LLM-powered root cause analysis."""
-        log.info("Performing root cause analysis")
-        
-        try:
-            # Build comprehensive context for LLM
-            context = {
-                "incident": request,
-                "forensic_summary": {
-                    "artifacts_collected": forensic_data.get("artifacts_collected", 0),
-                    "evidence_package": forensic_data.get("evidence_package", "Not available")
-                },
-                "log_summary": {
-                    "total_logs": log_analysis.get("total_logs_analyzed", 0),
-                    "suspicious_patterns": len(log_analysis.get("suspicious_patterns", []))
-                },
-                "network_summary": {
-                    "total_connections": network_analysis.get("total_connections", 0),
-                    "unique_destinations": network_analysis.get("summary", {}).get("unique_destinations", 0)
-                },
-                "timeline_events": len(timeline),
-                "iocs_found": {
-                    "ips": len(iocs.get("ips", [])),
-                    "domains": len(iocs.get("domains", [])),
-                    "commands": len(iocs.get("suspicious_commands", []))
-                },
-                "lateral_movement_risk": lateral_movement.get("overall_risk_score", 0),
-                "key_timeline_events": timeline[-10:] if timeline else [],  # Last 10 events
-                "top_iocs": {
-                    "ips": iocs.get("ips", [])[:5],  # Top 5 IPs
-                    "domains": iocs.get("domains", [])[:5],  # Top 5 domains
-                    "commands": iocs.get("suspicious_commands", [])[:3]  # Top 3 commands
-                }
-            }
-            
-            # Use LLM for root cause analysis
-            root_cause_analysis = await llm_client.analyze_incident_root_cause(
-                incident=request,
-                context=context
-            )
-            
-            log.info("Root cause analysis completed",
-                    confidence=root_cause_analysis.get("confidence", 0))
-            
-            return root_cause_analysis
-        
-        except Exception as e:
-            log.error("Root cause analysis failed", error=str(e))
-            
-            # Fallback analysis
-            return {
-                "summary": f"Automated analysis for incident {request.get('incident_id', 'unknown')}",
-                "attack_vector": "Unknown - LLM analysis failed",
-                "confidence": 0.5,
-                "recommendations": [
-                    "Review forensic evidence manually",
-                    "Investigate suspicious IOCs found",
-                    "Monitor for lateral movement indicators"
-                ],
-                "error": str(e)
-            }
-    
-    def _generate_investigation_report(self, **kwargs) -> Dict[str, Any]:
-        """Generate comprehensive investigation report."""
-        report_id = str(uuid.uuid4())[:8]
-        
-        report = {
-            "id": report_id,
-            "incident_id": kwargs["incident_id"],
-            "generated_at": datetime.utcnow().isoformat(),
-            "duration_seconds": kwargs["duration"],
-            "forensic_evidence": kwargs["forensic_data"],
-            "log_analysis": kwargs["log_analysis"],
-            "network_analysis": kwargs["network_analysis"],
-            "host_analysis": kwargs["host_analysis"],
-            "timeline": kwargs["timeline"],
-            "iocs": kwargs["iocs"],
-            "lateral_movement": kwargs["lateral_movement"],
-            "root_cause": kwargs["root_cause"],
-            "summary": {
-                "total_artifacts": kwargs["forensic_data"].get("artifacts_collected", 0),
-                "total_logs_analyzed": kwargs["log_analysis"].get("total_logs_analyzed", 0),
-                "total_connections": kwargs["network_analysis"].get("total_connections", 0),
-                "timeline_events": len(kwargs["timeline"]),
-                "total_iocs": (len(kwargs["iocs"].get("ips", [])) + 
-                              len(kwargs["iocs"].get("domains", [])) + 
-                              len(kwargs["iocs"].get("suspicious_commands", []))),
-                "lateral_movement_risk": kwargs["lateral_movement"].get("overall_risk_score", 0),
-                "root_cause_confidence": kwargs["root_cause"].get("confidence", 0.0)
-            }
-        }
-        
-        return report
-    
     async def _save_investigation_report(self, incident_id: str, report: Dict[str, Any]):
         """Save investigation report to database."""
         try:
@@ -897,18 +1034,6 @@ class InvestigationAgent:
         
         except Exception as e:
             log.error("Failed to save investigation report", error=str(e))
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get investigation agent statistics."""
-        return {
-            "total_investigations": self.investigation_count,
-            "successful_investigations": self.success_count,
-            "success_rate": (
-                self.success_count / self.investigation_count 
-                if self.investigation_count > 0 else 0
-            ),
-            "collectors_available": self.collector_manager.list_collectors() if self.collector_manager else []
-        }
 
 
 # Agent instance
