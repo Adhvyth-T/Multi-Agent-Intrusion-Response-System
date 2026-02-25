@@ -4,6 +4,104 @@ An AI-powered multi-agent system that autonomously detects, triages, contains, v
 
 ---
 
+## Directory Structure
+
+```
+Multi-Agent-ir-system/
+├── .env.example
+├── .gitignore
+├── README.md
+├── approve.py
+├── dashboard.py
+├── docker-compose.yml
+├── main.py
+├── requirements.txt
+├── simulate.py
+│
+├── agents/
+│   ├── __init__.py
+│   ├── communication.py
+│   ├── containment.py
+│   ├── context.py
+│   ├── decision_agent.py
+│   ├── detection.py
+│   ├── investigation.py
+│   ├── triage.py
+│   ├── trust_engine.py
+│   └── validation_service.py
+│
+├── attack_simulator/
+│   ├── __init__.py
+│   ├── real_attacks.py
+│   └── simulator.py
+│
+├── collectors/
+│   ├── __init__.py
+│   ├── base_collector.py
+│   ├── collector_factory.py
+│   ├── docker_collector.py
+│   ├── falco_collector.py
+│   ├── forensic_collector.py
+│   ├── host_collector.py
+│   ├── kubernetes_collector.py
+│   ├── log_collector.py
+│   └── network_collector.py
+│
+├── config/
+│   ├── __init__.py
+│   └── settings.py
+│
+├── core/
+│   ├── __init__.py
+│   ├── database.py
+│   ├── llm_client.py
+│   ├── models.py
+│   ├── queue.py
+│   └── actions/
+│       ├── __init__.py
+│       ├── base.py
+│       ├── models.py
+│       ├── registry.py
+│       └── executors/
+│           ├── __init__.py
+│           ├── delete_pod.py
+│           ├── network_isolate.py
+│           ├── pause_container.py
+│           └── restart_container.py
+│
+├── ml_models/
+│   ├── __init__.py
+│   ├── base_detector.py
+│   ├── cryptominer_detector.py
+│   ├── escape_detector.py
+│   ├── exfiltration_detector.py
+│   ├── network_detector.py
+│   ├── privilege_detector.py
+│   ├── shell_detector.py
+│   ├── train_with_datasets.py
+│   ├── datasets/
+│   │   ├── Readme.md
+│   │   ├── __init__.py
+│   │   ├── cicids_loader.py
+│   │   ├── downloader.py
+│   │   ├── nslkdd_loader.py
+│   │   └── raw/
+│   │       ├── KDDtest.txt
+│   │       └── KDDtrain.txt
+│   └── trained_models/
+│       ├── cryptominer_detector.pkl
+│       ├── exfiltration_detector.pkl
+│       ├── network_detector.pkl
+│       ├── privilege_detector.pkl
+│       └── shell_detector.pkl
+│
+└── utils/
+    ├── get_dbmetrics.py
+    └── run.bat
+```
+
+---
+
 ## Overview
 
 Traditional incident response is slow. A security analyst receives an alert, investigates manually, decides on a response, executes it, and verifies it worked. This takes 30-60 minutes on average.
