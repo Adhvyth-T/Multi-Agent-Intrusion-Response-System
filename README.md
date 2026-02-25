@@ -1,539 +1,214 @@
-# 🤖 Autonomous Incident Response System
+# Autonomous Incident Response System
 
-**Multi-Agent AI Framework for Automated Cybersecurity Response**
-
-> Reduces Mean Time to Respond (MTTR) from 45 minutes to <60 seconds through intelligent automation
-
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-enabled-blue.svg)](https://www.docker.com/)
-[![Redis](https://img.shields.io/badge/redis-required-red.svg)](https://redis.io/)
+An AI-powered multi-agent system that autonomously detects, triages, contains, validates, and investigates security incidents in containerized environments — end-to-end, in under a minute.
 
 ---
 
-## 📋 Overview
+## Overview
 
-Autonomous system that detects, analyzes, contains, investigates, and recovers from security incidents in Docker environments using a **6-agent architecture** with **LLM-powered reasoning** and **3-phase validation**.
+Traditional incident response is slow. A security analyst receives an alert, investigates manually, decides on a response, executes it, and verifies it worked. This takes 30-60 minutes on average.
 
-### Key Features
-
-- 🔍 **Dual-Layer Detection**: ML anomaly detection + pattern matching
-- 🧠 **LLM-Powered Triage**: Intelligent threat analysis with Gemini
-- 🛡️ **Autonomous Containment**: 5 production-ready action executors
-- ✅ **IVAM Validation**: 3-phase verification ensures actions work
-- 📊 **Progressive Trust**: Learns from history, gradually automates
-- 🔄 **Intelligent Fallback**: Auto-escalation on containment failure
-- 📧 **Multi-Channel Alerts**: Email, terminal, real-time notifications
+This system compresses that to under 60 seconds by orchestrating six specialized AI agents that work in sequence, each with a focused responsibility, sharing context through a central intelligence layer.
 
 ---
 
-## 🚀 Quick Start
+## Architecture
 
-### Prerequisites
+The system uses a pipeline architecture where incidents flow through agents via Redis queues. A shared Context Agent serves as the intelligence backbone, assembling rich unified context from all available sources and feeding it to every agent on demand.
 
-- Python 3.11+
-- Docker Desktop (running)
-- Redis Server
+```
+Attack Event
+    ↓
+Detection Agent  →  [triage queue]
+    ↓
+Triage Agent  (LLM: severity + confidence)  →  [decision queue]
+    ↓
+Decision Agent  (LLM: pick actions + trust level check)
+    ↓ AUTO                    ↓ APPROVAL_REQUIRED
+    |                    ApprovalManager (waits on Redis signal)
+    └──────────┬──────────────┘
+               ↓
+        [containment queue]
+               ↓
+        Containment Agent  (executes action)
+               ↓
+        [validation queue]
+               ↓
+        Validation Service  (IVAM: Phase 1 → 2 → 3)
+               ↓ FAIL                    ↓ PASS
+        Decision Agent (retry)     [investigation queue]
+        retry_number += 1               ↓
+               ↑___________       Investigation Agent
+                                  (root cause, IOCs, timeline)
+                                        ↓
+                                  [incident closed]
+                                  investigation_report → SQLite
 
-### Installation
+
+Communication Agent  ←←←←← all stages push to [notification queue]
+
+─────────────────────────────────────────────────────────────────
+Context Agent  (shared service, called directly)
+    ↓ assembles from SQLite on every call
+    ├── incidents, enriched_incidents, reasoning_chains
+    ├── actions, action_attempts, validation_attempts
+    ├── forensic_snapshot  (from ForensicCollector)
+    └── similar_incident_root_causes  ← last 2 closed incidents
+                                        of same type from SQLite
+                                        (feeds Decision + Investigation)
+```
+
+---
+
+## The Six Agents
+
+### Detection Agent
+Monitors Docker events in real time and runs ML-based threat classification. Uses Isolation Forest for anomaly detection alongside trained classifiers for cryptominers, data exfiltration, privilege escalation, reverse shells, and network attacks. Generates structured incident records and pushes them to the triage queue.
+
+### Triage Agent
+Pure analysis, no action decisions. Sends the incident to an LLM (Gemini 2.5 Flash) with MITRE ATT&CK mapping, asset criticality, and live forensic context. Produces a severity rating (P1-P4), confidence score, false positive determination, and a step-by-step reasoning chain. Hands off to the Decision Agent with just the essentials.
+
+### Decision Agent
+The strategic brain. Uses LLM to select the best containment actions from the registered executor pool, informed by triage analysis, forensic data, and historical root causes from similar past incidents. Then applies the Progressive Trust Engine to decide whether to auto-execute or require human approval.
+
+**Progressive Trust Engine:**
+
+| Level | Name | Actions Threshold | Confidence Required |
+|-------|------|-------------------|---------------------|
+| 1 | Learning | 0-50 | All require approval |
+| 2 | Cautious | 51-150 | >= 0.95 |
+| 3 | Confident | 151-500 | >= 0.90 |
+| 4 | Autonomous | 500+ | >= 0.85 |
+
+On retry after a validation failure, the LLM reads exact error messages from prior attempts to distinguish a genuine failure from a case where containment already succeeded (e.g. "Container not found" after delete_pod ran).
+
+### Containment Agent
+Executes containment actions using a plugin-based architecture with decorator auto-registration. Available executors:
+
+- `delete_pod` - forcefully removes the compromised container
+- `network_isolate` - applies egress deny network policy
+- `pause_container` - freezes the container without removal
+- `restart_container` - restarts with clean state
+- `capture_logs` - non-destructive evidence collection
+
+### Validation Service (IVAM)
+Three-phase validation that verifies every containment action actually worked:
+
+- **Phase 1 - Immediate (30s):** Did the action complete?
+- **Phase 2 - Sustained (5min):** Is containment still holding?
+- **Phase 3 - Effective:** Has the threat been eliminated?
+
+On failure, triggers a retry loop back to the Decision Agent with incremented retry number and full failure context.
+
+### Investigation Agent
+Performs deep forensic analysis after successful containment. Fully context-driven, reads forensic artifacts already captured by the background ForensicCollector rather than running its own collection. Produces a structured investigation report covering root cause, attack vector, attacker sophistication, IOCs (IPs, domains, hashes), timeline reconstruction, and lateral movement analysis. The report is persisted to SQLite and feeds future incidents as historical intelligence.
+
+### Communication Agent
+Listens to the notification queue throughout the entire pipeline and handles all outbound messaging: real-time alerts, stage progress updates, approval requests, and post-incident reports.
+
+---
+
+## Context Agent
+
+Not a pipeline stage but a shared intelligence service called directly by agents. On every call it assembles a unified context object by querying all relevant SQLite tables and the ForensicCollector concurrently:
+
+- Base incident data and triage enrichment
+- LLM reasoning chains
+- All containment actions and IVAM phase results
+- Live forensic snapshot (network connections, recent shell history)
+- Historical root causes from the last 2 resolved incidents of the same type, stripped of per-incident recommendations, used to inform both action selection and root cause analysis
+
+Context is cached in memory and annotated with phase_updates as the incident moves through the pipeline, so every agent sees the full history of what has happened so far.
+
+---
+
+## Forensic Collection
+
+A background ForensicCollector captures per-incident forensic snapshots:
+
+- **Network forensics** - active connections, listening ports, traffic patterns
+- **Shell history** - last 10 executed commands from bash/zsh/PowerShell history
+
+Registered with the Context Agent at startup and shared across the pipeline. Snapshots are captured as close to the incident as possible and accessed by the Investigation Agent through the Context Agent, avoiding redundant collection.
+
+---
+
+## Key Design Decisions
+
+**Context-driven investigation** — Early versions had the Investigation Agent running its own collectors. Refactoring to read from the Context Agent eliminated redundant collection and gave the LLM significantly richer input: full reasoning chain, triage confidence, containment history, and validation outcomes in one object.
+
+**Historical root causes in Decision Agent** — The Decision Agent knows what attack vectors were used in similar past incidents before selecting actions. A cryptominer that previously exploited a specific privilege escalation path informs the current response strategy.
+
+**Recommendations stripped from historical context** — Recommendations are per-incident action items. Only the analytical findings carry forward: attack vector, root cause, sophistication, impact. Passing stale recommendations would pollute the LLM reasoning.
+
+**LLM-driven retry logic** — On retry the LLM distinguishes a real failure from a spurious validation error. "Container not found" during Phase 2 after a successful delete_pod means the container is gone and containment succeeded. A rule-based system would incorrectly escalate.
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Agent runtime | Python 3.12 + asyncio |
+| LLM | Gemini 2.5 Flash (OpenRouter fallback) |
+| Queue | Redis |
+| Database | SQLite (aiosqlite) |
+| Container monitoring | Docker API |
+| ML detection | scikit-learn (Isolation Forest + classifiers) |
+| HTTP client | httpx + tenacity |
+| Validation | Pydantic |
+| Logging | structlog |
+| API | FastAPI |
+| Dashboard | Streamlit |
+
+---
+
+## Quick Start
+
+**Prerequisites:** Docker, Python 3.12+, Redis
 
 ```bash
-# 1. Clone repository
-git clone <your-repo-url>
-cd autonomous-ir-system
-
-# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Configure environment
 cp .env.example .env
-# Edit .env - add your Gemini API key
+# Add GEMINI_API_KEY and optionally OPENROUTER_API_KEY
 
-# 4. Initialize database
-python -c "import asyncio; from core import init_db; asyncio.run(init_db())"
-
-# 5. Start Redis (if not running)
-redis-server
-
-# 6. Start the system
 python main.py
 ```
 
-### Run Your First Attack
+In another terminal:
 
 ```bash
-# In another terminal
-python simulate.py single cryptominer
+python simulate.py attack cryptominer
+python simulate.py attack reverse_shell
+python simulate.py attack cpu_bomb
+python simulate.py attack port_scan
+python simulate.py attack all
+```
 
-# Watch the system respond automatically!
+**Environment overrides:**
+
+```
+IR_COLLECTOR=docker        Force Docker API collector (default on Windows/WSL2)
+IR_COLLECTOR=falco         Force Falco collector (Linux only)
+IR_DRY_RUN=true            Simulate actions without executing
+IR_ENABLE_SNAPSHOTS=false  Disable forensic snapshots
 ```
 
 ---
 
-## 🏗️ System Architecture
+## Performance Targets
 
-### Multi-Agent Design
-
-```
-┌─────────────┐     ┌─────────────┐     ┌──────────────┐
-│  Detection  │────▶│   Triage    │────▶│ Containment  │
-│   Agent     │     │   Agent     │     │    Agent     │
-└─────────────┘     └─────────────┘     └──────┬───────┘
-                                                │
-    ┌───────────────────────────────────────────┘
-    │
-    ▼
-┌──────────────┐     ┌─────────────┐     ┌──────────────┐
-│ Validation   │────▶│Investigation│────▶│Communication │
-│   Service    │     │    Agent    │     │    Agent     │
-└──────────────┘     └─────────────┘     └──────────────┘
-```
-
-### Data Flow
-
-```
-Docker Event → Detection (ML + Patterns) → Incident Created
-                                               ↓
-                              Triage (LLM Analysis) → Reasoning Chain
-                                               ↓
-                             Progressive Trust Check → AUTO/APPROVAL
-                                               ↓
-                           Containment (Execute Action) → Phase 1 ✓
-                                               ↓
-                          Validation Service (Background)
-                                               ↓
-                            Phase 2 (5 min) → Phase 3 → Done ✓
-                                               ↓
-                                    Investigation Agent
-```
+| Metric | Target |
+|--------|--------|
+| End-to-end MTTR | < 60 seconds |
+| Detection accuracy | >= 95% |
+| Auto-resolution rate (Level 3+) | >= 75% |
+| Action validation success | >= 98% |
+| False negatives on P1 threats | 0 |
 
 ---
 
-## 🎯 Agents (Current Status)
+## Academic Context
 
-### ✅ Implemented
-
-| Agent | Status | Purpose |
-|-------|--------|---------|
-| **Detection** | ✅ Complete | ML anomaly detection + pattern matching |
-| **Triage** | ✅ Complete | LLM-powered analysis, MITRE mapping, reasoning |
-| **Containment** | ✅ Complete | Execute actions with 5 executors |
-| **Validation Service** | ✅ Complete | IVAM 3-phase validation |
-| **Communication** | ✅ Complete | Email + Terminal notifications |
-
-### 🔄 In Progress
-
-| Agent | Status | Purpose |
-|-------|--------|---------|
-| **Investigation** | 🔄 Week 3 | Root cause analysis, IOC extraction |
-| **Recovery** | 🔄 Week 4 | Patch vulnerabilities, restore service |
-
----
-
-## 🛡️ Containment Actions
-
-### Available Executors
-
-| Action | Purpose | Destructive | Reversible |
-|--------|---------|-------------|------------|
-| `delete_pod` | Delete container | ✅ | ❌ |
-| `network_isolate` | Disconnect networks | ❌ | ✅ |
-| `pause_container` | Freeze execution | ❌ | ✅ |
-| `restart_container` | Clear runtime malware | ❌ | ❌ |
-| `resource_limit` | Throttle CPU/memory | ❌ | ✅ |
-
-### Fallback Strategies
-
-Each executor defines intelligent escalation if validation fails:
-
-```
-delete_pod (FAILED)
-   ↓
-restart_container (Level 2)
-   ↓
-pause_container (Level 3)
-   ↓
-manual_intervention (Level 4)
-```
-
----
-
-## ✅ IVAM Validation Framework
-
-**I**mmediate **V**alidation **A**nd **M**onitoring - Ensures containment actions actually work.
-
-### 3-Phase Validation
-
-| Phase | Timing | Purpose | Example |
-|-------|--------|---------|---------|
-| **Phase 1** | Immediate (30s) | Did action complete? | Container deleted? |
-| **Phase 2** | Sustained (5 min) | Still contained? | No respawn? |
-| **Phase 3** | Effective | Threat eliminated? | CPU normalized? |
-
-### Flow Diagram
-
-```
-Containment Agent
-    ↓
-Execute Action
-    ↓
-Phase 1: verify_immediate() ✓
-    ↓
-Push to validation_queue
-    ↓
-Validation Service (background)
-    ↓
-Wait 5 minutes
-    ↓
-Phase 2: verify_sustained() ✓
-    ↓
-Phase 3: verify_effective() ✓
-    ↓
-All phases passed ✓
-```
-
-If any phase fails → **Automatic fallback to next strategy level**
-
----
-
-## 📊 Progressive Trust Engine
-
-System learns from successful actions and gradually increases automation.
-
-### Trust Levels
-
-| Level | Name | Actions | Threshold | Behavior |
-|-------|------|---------|-----------|----------|
-| **1** | Learning | 0-50 | - | All actions require approval |
-| **2** | Cautious | 51-150 | 95% | High-confidence actions auto-execute |
-| **3** | Confident | 151-500 | 90% | Most actions auto-execute |
-| **4** | Autonomous | 500+ | 85% | Full automation with safety checks |
-
-### Safety Guardrails
-
-- P1 (critical) incidents require Level 3+ for auto-approval
-- Failed actions automatically demote trust level
-- Human override always available
-- Audit trail for all decisions
-
----
-
-## 🧪 Attack Simulator
-
-### Attack Types
-
-| Type | Detection Method | Containment Strategy |
-|------|------------------|----------------------|
-| `cryptominer` | High CPU + process pattern | Delete → Restart → Pause |
-| `data_exfiltration` | Network anomaly + large transfer | Network isolate → Delete |
-| `privilege_escalation` | Sudo attempts + permission changes | Delete → Alert |
-| `reverse_shell` | Suspicious connections | Network isolate → Delete |
-| `container_escape` | Mount attempts + syscall patterns | Delete → Quarantine node |
-
-### Commands
-
-```bash
-# Single attack
-python simulate.py single cryptominer
-
-# Multiple random attacks
-python simulate.py batch 5
-
-# Specific attack with custom settings
-python simulate.py single cryptominer --severity high
-
-# List all attack types
-python simulate.py list
-
-# System status
-python simulate.py status
-
-# Manually approve pending action
-python approve.py <action_id>
-```
-
----
-
-## 🔧 Configuration
-
-### Environment Variables (.env)
-
-```bash
-# LLM Configuration
-GEMINI_API_KEY=your_gemini_api_key_here
-LLM_MODEL=gemini-pro
-OPENROUTER_API_KEY=fallback_key  # Optional fallback
-
-# Email Notifications
-SMTP_SERVER=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USERNAME=your_email@gmail.com
-SMTP_PASSWORD=your_app_password
-SMTP_FROM=alerts@your-system.com
-SMTP_TO=security-team@your-company.com
-
-# System Settings
-DRY_RUN=false                    # Set true for testing
-ENABLE_SNAPSHOTS=true            # Forensic snapshots
-LOG_LEVEL=INFO
-
-# Trust Engine
-TRUST_LEVEL_1_MAX=50
-TRUST_LEVEL_2_MAX=150
-TRUST_LEVEL_3_MAX=500
-TRUST_LEVEL_2_THRESHOLD=0.95
-TRUST_LEVEL_3_THRESHOLD=0.90
-TRUST_LEVEL_4_THRESHOLD=0.85
-
-# Database
-SQLITE_PATH=./ir_system.db
-
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-```
-
-
----
-
-## 📈 Performance Metrics
-
-### Current Results
-
-| Metric | Manual | Autonomous | Improvement |
-|--------|--------|------------|-------------|
-| **MTTR** | 45 min | <60 sec | **99%** ↓ |
-| Detection Time | 15-30 min | <5 sec | 99.7% ↓ |
-| Analysis Time | 20-40 min | 2-5 sec | 99.5% ↓ |
-| Containment Time | 10-20 min | 5-10 sec | 99.2% ↓ |
-| **Detection Accuracy** | - | 97% | - |
-| **False Positive Rate** | - | 3% | - |
-| **Auto-Resolution Rate** | 0% | 82% | - |
-| **Phase 1 Validation** | - | 99% | - |
-
----
-
-## 🧪 Testing
-
-### End-to-End Test
-
-```bash
-# 1. Start system
-python main.py
-
-# 2. Deploy malicious container
-python simulate.py single cryptominer
-
-# 3. Watch logs - should see:
-# [INFO] Detection: High CPU detected (98%)
-# [INFO] Triage: Cryptominer detected, confidence: 0.96
-# [INFO] Trust Engine: Level 3 → AUTO APPROVE
-# [INFO] Containment: Container deleted
-# [INFO] Phase 1 validation: PASSED
-# [INFO] Pushed to validation queue
-# ... 5 minutes later ...
-# [INFO] Phase 2 validation: PASSED (no respawn)
-# [INFO] Phase 3 validation: PASSED (CPU normal)
-# [INFO] Incident resolved
-
-# Total time: ~42 seconds + 5 min validation
-```
-
-### Test Validation Failure
-
-```bash
-# Deploy container with restart policy (will respawn)
-docker run -d --name test-respawn --restart=always nginx
-
-# Mark as malicious - system will delete it
-# But Phase 2 will detect respawn
-# Fallback will trigger automatically
-```
-
----
-
-## 🎬 Demo Scenario
-
-### Cryptominer Attack Response
-
-```
-T+0s:  🐛 Attacker deploys malicious container
-T+3s:  🔍 Detection Agent: High CPU usage (98%)
-T+5s:  🧠 Triage Agent: "Cryptominer, confidence: 0.96"
-T+6s:  ⚖️ Trust Engine: Level 3 → AUTO APPROVE
-T+8s:  🛡️ Containment: Container deleted
-T+10s: ✅ Phase 1: Container removed
-T+5m:  ✅ Phase 2: No respawn detected
-T+6m:  ✅ Phase 3: CPU usage normalized
-T+7m:  📧 Email report sent to SOC team
-
-✅ Incident resolved in 42 seconds
-   (Manual response would take 45+ minutes)
-```
-
----
-
-## 🔍 Monitoring & Logs
-
-### Check System Status
-
-```bash
-# View agent health
-python simulate.py status
-
-# Check trust level
-sqlite3 ir_system.db "SELECT * FROM trust_metrics"
-
-# View recent incidents
-sqlite3 ir_system.db "SELECT * FROM incidents ORDER BY created_at DESC LIMIT 5"
-
-# Check validation results
-sqlite3 ir_system.db "SELECT * FROM validation_attempts WHERE action_id='<action_id>'"
-
-# View containment actions
-sqlite3 ir_system.db "SELECT * FROM actions WHERE status='success'"
-
-#View recommendations from investigation agent
-sqlite3 ir_system.db "SELECT investigation_report FROM incidents WHERE id = '<incident_id>'"
-
-```
-
-### Logs
-
-```bash
-# Real-time logs
-tail -f logs/ir_system.log
-
-# Filter by agent
-tail -f logs/ir_system.log | grep "Detection"
-tail -f logs/ir_system.log | grep "Containment"
-tail -f logs/ir_system.log | grep "IVAM"
-```
-
----
-
-## 🚧 Roadmap
-
-### Completed ✅
-- [x] Detection Agent with ML + pattern matching
-- [x] Triage Agent with LLM reasoning
-- [x] Containment Agent with 5 executors
-- [x] Progressive Trust Engine
-- [x] IVAM 3-phase validation
-- [x] Intelligent fallback strategies
-- [x] Communication Agent (Email + Terminal)
-- [x] Attack simulator with 5 threat types
-- [x] Database with validation tracking
-- [ ] Investigation Agent (Week 3, Days 6-7)
-  - Root cause analysis
-  - IOC extraction
-  - Lateral movement detection
-### In Progress 🔄
-- [ ] Recovery Agent (Week 4, Days 1-2)
-  - Vulnerability patching
-  - Secret rotation
-  - Policy updates
-
-### Future 🔮
-- [ ] Web Dashboard (React + TypeScript)
-- [ ] Kubernetes support
-- [ ] Cloud provider integrations (AWS, Azure, GCP)
-- [ ] Advanced ML models (LSTM, Transformer)
-- [ ] SIEM integration (Splunk, ELK)
-- [ ] Multi-tenant support
-- [ ] Automated PDF reports
-
----
-
-## 🐛 Troubleshooting
-
-### Database Errors
-
-```bash
-# If you see "no such column: verified"
-python migrate_db.py
-
-# If database is corrupted
-rm ir_system.db
-python -c "import asyncio; from core import init_db; asyncio.run(init_db())"
-```
-
-### Redis Connection Issues
-
-```bash
-# Check if Redis is running
-redis-cli ping
-# Should return: PONG
-
-# Start Redis if not running
-redis-server
-
-# Or use Docker
-docker run -d -p 6379:6379 redis:alpine
-```
-
-### LLM API Errors
-
-```bash
-# Check API key in .env
-cat .env | grep GEMINI_API_KEY
-
-# Test API connection
-python -c "
-import os
-from google import generativeai as genai
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-model = genai.GenerativeModel('gemini-pro')
-response = model.generate_content('Hello')
-print(response.text)
-"
-```
-
----
-
-## 📚 Documentation
-
-- [IVAM Integration Guide](docs/IVAM_INTEGRATION_GUIDE.md)
-- [Validation Queue Flow](docs/VALIDATION_QUEUE_FLOW.md)
-- [Project Plan](docs/PROJECT_PLAN.md)
-- [Executive Summary](docs/EXECUTIVE_SUMMARY.md)
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-This project is part of a final year academic project.
-
----
-
-## 🙏 Acknowledgments
-
-- **MITRE ATT&CK** framework for threat taxonomy
-- **Google Gemini** for LLM capabilities
-- **scikit-learn** for ML models
-- **Docker** for containerization
-- Faculty advisors for guidance
-
----
-
-
-<div align="center">
-
-**⭐ Star this repo if you find it useful!**
-
-**From detection to recovery in under 60 seconds**
-
-Made with ❤️ for the cybersecurity community
-
-</div>
+Built as a final year project demonstrating enterprise-level software engineering applied to a real security automation problem: multi-agent AI orchestration, progressive trust systems, forensic evidence collection, and LLM-powered reasoning with transparent decision chains.

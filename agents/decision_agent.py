@@ -310,6 +310,7 @@ class DecisionAgent:
         mitre = context.get("mitre_mapping", {})
         criticality = context.get("asset_criticality", {})
         forensics = context.get("forensic_snapshot", {})
+        similar_root_causes = context.get("similar_incident_root_causes", [])
         # phase_updates[phase] is a list of dicts (update_context appends each call)
         # Use [-1] for latest entry
         triage_history = context.get("phase_updates", {}).get("triage", [])
@@ -336,6 +337,7 @@ class DecisionAgent:
                 triage_summary=triage_update.get("llm_summary", ""),
                 available_actions=action_descriptions,
                 pipeline_history=pipeline_history,
+                similar_incident_root_causes=similar_root_causes,
             )
 
             actions = result.get("actions", [])

@@ -113,6 +113,7 @@ class ContextAgent:
             action_attempts,
             validation_attempts,
             forensic_snapshot,
+            similar_root_causes,
         ) = await asyncio.gather(
             self._get_incident(incident_id),
             self._get_enriched_incident(incident_id),
@@ -121,6 +122,7 @@ class ContextAgent:
             self._get_action_attempts(incident_id),
             self._get_validation_attempts(incident_id),
             self._get_forensic_snapshot(incident_id),
+            self._get_similar_incident_root_causes(incident_id),
             return_exceptions=True,
         )
 
@@ -132,6 +134,7 @@ class ContextAgent:
         context["action_attempts"] = action_attempts if not isinstance(action_attempts, Exception) else []
         context["validation_attempts"] = validation_attempts if not isinstance(validation_attempts, Exception) else []
         context["forensic_snapshot"] = forensic_snapshot if not isinstance(forensic_snapshot, Exception) else {}
+        context["similar_incident_root_causes"] = similar_root_causes if not isinstance(similar_root_causes, Exception) else []
 
         # Derived fields
         context["mitre_mapping"] = MITRE_MAPPING.get(
@@ -157,6 +160,7 @@ class ContextAgent:
             attempts_count=len(context["action_attempts"]),
             has_live_forensics=context["has_live_forensics"],
             retry_count=len(context["retry_history"]),
+            similar_incidents=len(context["similar_incident_root_causes"]),
         )
 
         return context
@@ -404,6 +408,79 @@ class ContextAgent:
             log.error("Failed to fetch validation attempts", incident_id=incident_id, error=str(e))
             return []
 
+    async def _get_similar_incident_root_causes(self, incident_id: str) -> List[Dict[str, Any]]:
+        """
+        Fetch root_cause (without recommendations) from the last 2 resolved incidents
+        of the same type as the current incident. Excludes the current incident itself.
+
+        Used to give the LLM historical pattern context:
+        - Was this attack vector seen before?
+        - What was the attacker's sophistication last time?
+        - How confident was the previous analysis?
+        """
+        try:
+            # First get the type of the current incident
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT type FROM incidents WHERE id = ?",
+                    (incident_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if not row:
+                        return []
+                    incident_type = row["type"]
+
+                # Now fetch the last 2 similar incidents that have investigation reports
+                async with db.execute(
+                    """
+                    SELECT id, created_at, investigation_report
+                    FROM incidents
+                    WHERE type = ?
+                      AND id != ?
+                      AND investigation_report IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT 2
+                    """,
+                    (incident_type, incident_id),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+
+            results = []
+            for row in rows:
+                try:
+                    report = json.loads(row["investigation_report"])
+                    raw_root_cause = report.get("root_cause", {})
+
+                    if not raw_root_cause:
+                        continue
+
+                    # Strip recommendations - they're per-incident, not historical signal
+                    root_cause = {k: v for k, v in raw_root_cause.items() if k != "recommendations"}
+
+                    results.append({
+                        "incident_id": row["id"],
+                        "occurred_at": row["created_at"],
+                        "root_cause": root_cause,
+                    })
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            if results:
+                log.info(
+                    "Similar incident root causes loaded",
+                    incident_id=incident_id,
+                    incident_type=incident_type,
+                    similar_count=len(results),
+                )
+
+            return results
+
+        except Exception as e:
+            log.error("Failed to fetch similar incident root causes",
+                      incident_id=incident_id, error=str(e))
+            return []
+
     async def _get_forensic_snapshot(self, incident_id: str) -> Dict[str, Any]:
         """
         Fetch forensic snapshot from the collector if available.
@@ -567,8 +644,9 @@ class ContextAgent:
                 "escalate_strategy" if retry_number > 0 else "initial_containment"
             ),
         }
+        log.info("Context prepared for Decision Agent",contextdes=context["decision_context"])
         return context
-
+        
     async def get_context_for_investigation(self, incident_id: str) -> Dict[str, Any]:
         """
         Returns context shaped for the Investigation Agent.

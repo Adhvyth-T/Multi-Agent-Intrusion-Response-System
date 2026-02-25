@@ -233,6 +233,7 @@ Provide detailed root cause analysis in the specified JSON format."""
         triage_summary: str,
         available_actions: Dict[str, Any],
         pipeline_history: Optional[Dict[str, Any]] = None,
+        similar_incident_root_causes: Optional[list] = None,
     ) -> Dict[str, Any]:
         """
         Select the best containment actions for an incident from the registered executors.
@@ -246,6 +247,10 @@ Provide detailed root cause analysis in the specified JSON format."""
             "containment": {"actions_taken": [{"action_type", "success", "message"}]},
             "validation":  {"last_failure_phase", "last_failure_message", "last_failed_action"}
         }
+
+        similar_incident_root_causes (optional): root causes from last 2 similar incidents.
+        Each entry: {"incident_id", "occurred_at", "root_cause": {attack_vector, root_cause,
+                      attacker_sophistication, confidence, impact_assessment}}
 
         Returns:
         {
@@ -265,6 +270,7 @@ Rules:
 - For P3/P4, prefer reversible actions that preserve forensic evidence.
 - Return 1-3 actions maximum, ordered by priority (1 = highest).
 - params should be empty {} unless you have specific values to pass.
+- If historical incidents are provided, use their attack vectors and root causes to inform your strategy.
 
 Respond ONLY in this exact JSON format with no extra text:
 {
@@ -299,6 +305,23 @@ PIPELINE HISTORY:
             if validation.get("last_failure_message"):
                 history_section += f"- Validation failure ({validation.get('last_failure_phase')}): {validation.get('last_failure_message')}\n"
 
+        # Build historical context section
+        historical_section = ""
+        if similar_incident_root_causes:
+            historical_section = "\nHISTORICAL CONTEXT (similar past incidents):\n"
+            for i, entry in enumerate(similar_incident_root_causes, 1):
+                rc = entry.get("root_cause", {})
+                if not rc:
+                    continue
+                historical_section += f"""
+Past Incident {i} (occurred: {entry.get("occurred_at", "unknown")}):
+- Attack Vector: {rc.get("attack_vector", "unknown")}
+- Root Cause: {rc.get("root_cause", "unknown")}
+- Attacker Sophistication: {rc.get("attacker_sophistication", "unknown")}
+- Confidence: {rc.get("confidence", "unknown")}
+- Impact: {rc.get("impact_assessment", "unknown")}
+"""
+
         prompt = f"""Select containment actions for this incident:
 
 INCIDENT:
@@ -316,7 +339,7 @@ TRIAGE ANALYSIS:
 {triage_summary or 'No triage summary available'}
 
 LIVE FORENSICS AVAILABLE: {bool(forensic_snapshot)}
-{history_section}
+{history_section}{historical_section}
 AVAILABLE CONTAINMENT ACTIONS:
 {_json.dumps(available_actions, indent=2)}
 
