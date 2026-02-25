@@ -112,6 +112,29 @@ Summary:
 ---
 Autonomous IR System
 """
+    },
+    "containment_retries_exhausted": {
+        "subject": "🚨 CRITICAL: Containment Failed After {max_retries} Attempts - {incident_id}",
+        "body": """
+CONTAINMENT FAILURE - HUMAN ATTENTION REQUIRED
+===============================================
+
+Incident ID: {incident_id}
+Resource: {resource}
+Retries Attempted: {max_retries}
+Time: {timestamp}
+
+The autonomous system could not confirm containment after {max_retries}
+full execute-validate cycles. Manual intervention may be required.
+
+Note: Automated investigation is proceeding in parallel.
+
+Summary:
+{summary}
+
+---
+Autonomous IR System
+"""
     }
 }
 
@@ -229,7 +252,15 @@ class CommunicationAgent:
         
         # Try to send email
         template = TEMPLATES.get(notif_type)
-        if template and config.alert_email:
+        force_email = "email" in notification.get("channels", [])
+        if (template or force_email) and config.alert_email:
+            if not template:
+                # No template — send a plain summary email
+                subject = f"[{notification.get('severity','P3')}] {notif_type.upper()} - {notification.get('incident_id','')}"
+                body = notification.get("summary", str(notification))
+                await self.email.send(config.alert_email, subject, body)
+                return
+
             # Format subject - notification already contains timestamp
             subject = template["subject"].format(**notification)
             

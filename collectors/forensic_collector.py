@@ -8,6 +8,7 @@ import asyncio
 import subprocess
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime, timedelta
@@ -191,10 +192,8 @@ class ForensicCollector(BaseEventCollector):
         
         # Capture tasks - run concurrently for speed
         capture_tasks = [
-            self._capture_live_processes(output_dir),
             self._capture_live_network(output_dir),
-            self._capture_live_system_state(output_dir),
-            self._capture_container_state(output_dir, resource)
+            self._capture_recent_shell_commands(output_dir),
         ]
         
         results = await asyncio.gather(*capture_tasks, return_exceptions=True)
@@ -462,6 +461,72 @@ class ForensicCollector(BaseEventCollector):
         
         return artifacts
     
+    async def _capture_recent_shell_commands(self, output_dir: Path) -> List[Dict[str, Any]]:
+        """Capture last 10 executed shell commands from history files."""
+        self.log.info("Capturing recent shell commands")
+        artifacts = []
+
+        try:
+            commands_path = output_dir / "recent_shell_commands.json"
+            collected = {}
+
+            if self.is_windows:
+                # PowerShell history
+                ps_history = Path.home() / "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt"
+                if ps_history.exists():
+                    lines = ps_history.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    collected["powershell"] = [l.strip() for l in lines if l.strip()][-10:]
+            else:
+                # bash and zsh history files
+                for shell, history_file in [("bash", "~/.bash_history"), ("zsh", "~/.zsh_history")]:
+                    path = Path(history_file).expanduser()
+                    if path.exists():
+                        try:
+                            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                            # Strip zsh extended history prefix (": <timestamp>:0;")
+                            cleaned = [
+                                re.sub(r"^:\s*\d+:\d+;", "", l).strip()
+                                for l in lines if l.strip()
+                            ]
+                            collected[shell] = cleaned[-10:]
+                        except Exception as e:
+                            self.log.debug(f"{shell} history read error", error=str(e))
+
+                # Fallback: subprocess if no history files found
+                if not collected:
+                    try:
+                        result = subprocess.run(
+                            ["bash", "-c", "history 10"],
+                            capture_output=True, text=True, timeout=5,
+                            env={**os.environ, "HISTFILE": os.path.expanduser("~/.bash_history")}
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            collected["bash_live"] = [
+                                line.strip() for line in result.stdout.splitlines() if line.strip()
+                            ]
+                    except Exception as e:
+                        self.log.debug("bash history subprocess error", error=str(e))
+
+            with open(commands_path, "w") as f:
+                json.dump({
+                    "captured_at": datetime.utcnow().isoformat(),
+                    "shells": collected,
+                    "note": "Last 10 commands per shell"
+                }, f, indent=2)
+
+            artifacts.append({
+                "type": "shell_history",
+                "name": "recent_shell_commands.json",
+                "path": str(commands_path),
+                "size": commands_path.stat().st_size,
+                "description": "Last 10 executed shell commands"
+            })
+
+        except Exception as e:
+            self.log.error("Shell history capture error", error=str(e))
+
+        return artifacts
+
     async def _periodic_cleanup(self):
         """Periodic cleanup task."""
         while self.running:
@@ -556,11 +621,8 @@ class ForensicCollector(BaseEventCollector):
         try:
             # Standard collection tasks
             tasks = [
-                self._collect_process_forensics(incident_dir, incident_id),
                 self._collect_network_forensics(incident_dir, incident_id),
-                self._collect_file_forensics(incident_dir, incident_id, resource),
-                self._collect_system_state(incident_dir, incident_id),
-                self._collect_logs(incident_dir, incident_id),
+                self._capture_recent_shell_commands(incident_dir),
             ]
             
             results = await asyncio.gather(*tasks, return_exceptions=True)

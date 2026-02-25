@@ -14,22 +14,9 @@ import structlog
 import re
 
 from core import queue, llm_client, save_incident, update_incident, IncidentStatus
-from collectors import CollectorManager, CollectorFactory, ForensicCollector, LogCollector, NetworkCollector, HostCollector
-from config import config
+from agents.context import context_agent
 
 log = structlog.get_logger()
-
-# Global forensic collector registry for sharing between agents
-_GLOBAL_FORENSIC_COLLECTOR = None
-
-def set_global_forensic_collector(collector):
-    """Set the global forensic collector instance."""
-    global _GLOBAL_FORENSIC_COLLECTOR
-    _GLOBAL_FORENSIC_COLLECTOR = collector
-
-def get_global_forensic_collector():
-    """Get the global forensic collector instance."""
-    return _GLOBAL_FORENSIC_COLLECTOR
 
 
 class IOCExtractor:
@@ -436,65 +423,28 @@ class LateralMovementAnalyzer:
 
 
 class InvestigationAgent:
-    """Enhanced Investigation Agent with live forensic snapshot integration."""
+    """Investigation Agent - uses Context Agent for all incident data."""
     
     def __init__(self):
         self.running = False
-        self.collector_manager = None
         self.ioc_extractor = IOCExtractor()
         self.investigation_count = 0
         self.success_count = 0
-        self.live_snapshots_used = 0
         
-        log.info("Investigation Agent initialized with live snapshot support")
+        log.info("Investigation Agent initialized")
     
     async def start(self):
         """Start the investigation agent."""
         self.running = True
-        
-        # Initialize collectors for investigation
-        log.info("Setting up investigation collectors...")
-        await self._setup_collectors()
-        
-        log.info("Investigation Agent started with live forensic integration")
+        log.info("Investigation Agent started")
         await self._investigation_loop()
     
     async def stop(self):
         """Stop the investigation agent."""
         self.running = False
-        
-        if self.collector_manager:
-            await self.collector_manager.stop_all()
-        
         log.info("Investigation Agent stopped",
                 total_investigations=self.investigation_count,
-                successful=self.success_count,
-                live_snapshots_used=self.live_snapshots_used)
-    
-    async def _setup_collectors(self):
-        """Set up collectors needed for investigation."""
-        try:
-            # Create investigation collectors (EXCEPT forensic - we'll use the background service)
-            investigation_collectors = await CollectorFactory.create_investigation_collectors(
-                collectors=['log', 'network', 'host'],  # Remove 'forensic'
-                evidence_dir="./evidence"
-            )
-            
-            # Set up collector manager
-            self.collector_manager = CollectorManager()
-            
-            # Add investigation collectors
-            for collector in investigation_collectors:
-                await self.collector_manager.add_collector(collector.name, collector)
-            
-            # IMPORTANT: We'll get the forensic collector from the global registry
-            # instead of creating a new instance
-            log.info("Investigation collectors ready (using background forensic service)",
-                    count=len(investigation_collectors))
-            
-        except Exception as e:
-            log.error("Failed to setup investigation collectors", error=str(e))
-            raise
+                successful=self.success_count)
     
     async def _investigation_loop(self):
         """Main investigation processing loop."""
@@ -509,63 +459,56 @@ class InvestigationAgent:
                 await asyncio.sleep(1)
     
     async def _process_investigation(self, request: Dict[str, Any]):
-        """Process a single investigation request."""
+        """Process a single investigation request using full context from Context Agent."""
         incident_id = request.get("incident_id")
-        resource = request.get("resource", "unknown")
         
-        log.info("Starting investigation",
-                incident_id=incident_id,
-                resource=resource)
-        
+        log.info("Starting investigation", incident_id=incident_id)
         self.investigation_count += 1
         investigation_start = datetime.utcnow()
         
         try:
-            # 1. Check for live forensic snapshot first (NEW!)
-            forensic_data = await self._get_forensic_evidence(incident_id, resource)
-            has_live_data = forensic_data.get("has_live_data", False)
+            # 1. Pull everything from Context Agent - forensics, enriched triage,
+            #    reasoning chain, actions, validation results - all in one call.
+            context = await context_agent.get_context_for_investigation(incident_id)
             
-            if has_live_data:
-                self.live_snapshots_used += 1
-                log.info("🔬 Using LIVE forensic snapshot", 
-                        incident_id=incident_id,
-                        artifacts=forensic_data.get("artifacts_collected", 0))
-            else:
-                log.info("Using post-incident forensic collection", incident_id=incident_id)
+            incident      = context["incident"]
+            forensic_data = context["forensic_snapshot"]
+            has_live_data = context["has_live_forensics"]
+            enriched      = context["enriched"]
             
-            # 2. Analyze logs
-            log_analysis = await self._analyze_logs(incident_id, resource)
+            log.info("Context loaded",
+                     incident_id=incident_id,
+                     has_live_forensics=has_live_data,
+                     artifacts=len(forensic_data.get("artifacts", [])),
+                     actions_taken=len(context["actions"]))
             
-            # 3. Analyze network activity
-            network_analysis = await self._analyze_network_activity(incident_id)
+            # 2. Extract log + network analysis directly from forensic artifact files
+            #    already captured by the ForensicCollector - no new collection needed.
+            log_analysis     = self._extract_logs_from_context(context)
+            network_analysis = self._extract_network_from_context(context)
             
-            # 4. Analyze host state
-            host_analysis = await self._analyze_host_state(incident_id)
+            # 3. Reconstruct timeline
+            timeline = self._reconstruct_timeline(incident, forensic_data, log_analysis, network_analysis)
             
-            # 5. Reconstruct timeline
-            timeline = await self._reconstruct_timeline(
-                request, forensic_data, log_analysis, network_analysis
-            )
-            
-            # 6. Extract IOCs (enhanced with live data)
+            # 4. Extract IOCs
             iocs = await self._extract_iocs(forensic_data, log_analysis, network_analysis)
             
-            # 7. Analyze lateral movement
-            lateral_movement = await self._analyze_lateral_movement(network_analysis, log_analysis)
+            # 5. Lateral movement analysis
+            lateral_movement = self._analyze_lateral_movement(network_analysis, log_analysis)
             
-            # 8. LLM-powered root cause analysis (with live data context)
+            # 6. LLM root cause - now receives full context including reasoning chain,
+            #    enriched triage, containment actions and validation results.
             root_cause = await self._perform_root_cause_analysis(
-                request, forensic_data, log_analysis, network_analysis, 
-                timeline, iocs, lateral_movement, has_live_data
+                context, timeline, iocs, lateral_movement
             )
             
-            # 9. Generate enhanced investigation report
+            # 7. Generate report
             investigation_report = self._generate_investigation_report(
                 incident_id=incident_id,
                 forensic_data=forensic_data,
                 log_analysis=log_analysis,
                 network_analysis=network_analysis,
-                host_analysis=host_analysis,
+                host_analysis={},   # no longer collected separately
                 timeline=timeline,
                 iocs=iocs,
                 lateral_movement=lateral_movement,
@@ -574,31 +517,33 @@ class InvestigationAgent:
                 has_live_data=has_live_data
             )
             
-            # 10. Save investigation results
+            # 8. Persist + annotate context
             await self._save_investigation_report(incident_id, investigation_report)
-            
-            # 11. Update incident status
-            await update_incident(incident_id, {
-                "status": IncidentStatus.RECOVERING.value
+            context_agent.update_context(incident_id, "investigation", {
+                "root_cause_summary": root_cause.get("summary"),
+                "iocs_found": len(iocs.get("ips", [])) + len(iocs.get("domains", [])),
+                "timeline_events": len(timeline),
+                "confidence": root_cause.get("confidence", 0.0),
             })
             
-            # 12. Push to recovery queue
+            await update_incident(incident_id, {"status": IncidentStatus.RECOVERING.value})
+            
+            # 9. Push to recovery queue
             await queue.push("recovery", {
                 "incident_id": incident_id,
                 "investigation_id": investigation_report["id"],
                 "root_cause": root_cause,
                 "recommendations": root_cause.get("recommendations", []),
                 "iocs": iocs,
-                "timeline": timeline[-5:],  # Last 5 events for context
-                "severity": request.get("severity", "P3"),
+                "timeline": timeline[-5:],
+                "severity": incident.get("severity", "P3"),
                 "has_live_data": has_live_data
             })
             
-            # 13. Send enhanced notification
             await queue.push("notification", {
                 "type": "investigation_complete",
                 "incident_id": incident_id,
-                "severity": request.get("severity", "P3"),
+                "severity": incident.get("severity", "P3"),
                 "iocs_found": len(iocs.get("ips", [])) + len(iocs.get("domains", [])),
                 "timeline_events": len(timeline),
                 "root_cause": root_cause.get("summary", "Investigation completed"),
@@ -609,7 +554,7 @@ class InvestigationAgent:
             })
             
             self.success_count += 1
-            log.info("Investigation completed successfully",
+            log.info("Investigation completed",
                     incident_id=incident_id,
                     duration_seconds=investigation_report["duration_seconds"],
                     iocs_found=len(iocs.get("ips", [])) + len(iocs.get("domains", [])),
@@ -617,12 +562,7 @@ class InvestigationAgent:
                     has_live_data=has_live_data)
             
         except Exception as e:
-            log.error("Investigation failed",
-                     incident_id=incident_id,
-                     error=str(e),
-                     exc_info=True)
-            
-            # Send error notification
+            log.error("Investigation failed", incident_id=incident_id, error=str(e), exc_info=True)
             await queue.push("notification", {
                 "type": "investigation_error",
                 "incident_id": incident_id,
@@ -631,117 +571,214 @@ class InvestigationAgent:
                 "summary": f"Investigation failed: {str(e)}"
             })
     
-    async def _get_forensic_evidence(self, incident_id: str, resource: str) -> Dict[str, Any]:
-        """Get forensic evidence - prioritizing live snapshots from background service."""
-        log.info("Getting forensic evidence", incident_id=incident_id)
-        
-        # Get the background forensic collector instance (the one with live snapshots)
-        forensic_collector = get_global_forensic_collector()
-        
-        if not forensic_collector:
-            log.warning("Background forensic collector not available")
-            return {"has_live_data": False}
-        
-        try:
-            # This now intelligently uses live snapshot if available
-            result = await forensic_collector.collect_incident_forensics(
-                incident_id=incident_id,
-                resource=resource
-            )
-            
-            log.info("Forensic evidence retrieved",
-                    incident_id=incident_id,
-                    artifacts=result.get("artifacts_collected", 0),
-                    has_live_data=result.get("has_live_data", False))
-            
-            return result
-        
-        except Exception as e:
-            log.error("Forensic evidence retrieval failed", error=str(e))
-            return {"has_live_data": False, "error": str(e)}
+    def _extract_logs_from_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract log data from forensic artifact files already stored in context.
+        Reads shell_history artifacts and any log-type artifacts on disk.
+        """
+        logs = []
+        suspicious_patterns = []
+        threat_keywords = [
+            'error', 'exception', 'fail', 'attack', 'malware',
+            'unauthorized', 'denied', 'blocked', 'suspicious'
+        ]
+
+        artifacts = context.get("forensic_snapshot", {}).get("artifacts", [])
+        for artifact in artifacts:
+            artifact_type = artifact.get("type", "")
+            file_path = artifact.get("path", "")
+
+            # Only read log-like artifacts
+            if not any(t in artifact_type for t in ['log', 'shell_history']):
+                continue
+
+            if not file_path or not os.path.exists(file_path):
+                continue
+
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(50000)  # cap at 50KB
+
+                # Turn each non-empty line into a log entry
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = {
+                        "message": line,
+                        "source": artifact_type,
+                        "timestamp": artifact.get("captured_at", context["assembled_at"])
+                    }
+                    logs.append(entry)
+
+                    # Flag suspicious lines
+                    if any(kw in line.lower() for kw in threat_keywords):
+                        suspicious_patterns.append({
+                            "pattern": next(kw for kw in threat_keywords if kw in line.lower()),
+                            "line": line,
+                            "source": artifact_type
+                        })
+
+            except Exception as e:
+                log.debug("Could not read artifact file", path=file_path, error=str(e))
+
+        log.info("Log extraction from context complete",
+                 total_logs=len(logs), suspicious=len(suspicious_patterns))
+        return {
+            "logs": logs,
+            "suspicious_patterns": suspicious_patterns,
+            "total_logs_analyzed": len(logs)
+        }
+
+    def _extract_network_from_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract network connection data from forensic artifact files already in context.
+        Reads live_network_connections / live_connection_details artifacts.
+        """
+        connections = []
+        unique_destinations: set = set()
+
+        artifacts = context.get("forensic_snapshot", {}).get("artifacts", [])
+        for artifact in artifacts:
+            artifact_type = artifact.get("type", "")
+            file_path = artifact.get("path", "")
+
+            if not any(t in artifact_type for t in ['network', 'connection', 'netstat']):
+                continue
+
+            if not file_path or not os.path.exists(file_path):
+                continue
+
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                # JSON artifacts (live_connections.json)
+                if file_path.endswith('.json'):
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        for conn in data:
+                            connections.append(conn)
+                            raddr = conn.get('raddr') or conn.get('remote_addr')
+                            if raddr:
+                                unique_destinations.add(raddr)
+                else:
+                    # Plain text netstat - parse lines
+                    for line in content.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        connections.append({"raw": line, "source": "netstat"})
+
+            except Exception as e:
+                log.debug("Could not read network artifact", path=file_path, error=str(e))
+
+        log.info("Network extraction from context complete",
+                 total_connections=len(connections),
+                 unique_destinations=len(unique_destinations))
+        return {
+            "connections": connections,
+            "summary": {"unique_destinations": len(unique_destinations)},
+            "total_connections": len(connections)
+        }
     
-    async def _perform_root_cause_analysis(self, request: Dict[str, Any],
-                                          forensic_data: Dict[str, Any],
-                                          log_analysis: Dict[str, Any],
-                                          network_analysis: Dict[str, Any],
+    async def _perform_root_cause_analysis(self,
+                                          context: Dict[str, Any],
                                           timeline: List[Dict[str, Any]],
                                           iocs: Dict[str, Any],
-                                          lateral_movement: Dict[str, Any],
-                                          has_live_data: bool = False) -> Dict[str, Any]:
-        """Enhanced root cause analysis with live data context."""
-        log.info("Performing root cause analysis", has_live_data=has_live_data)
+                                          lateral_movement: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Root cause analysis using the full incident context assembled by Context Agent.
+        Receives reasoning chain, enriched triage, containment actions and validation
+        results - significantly richer than what collector-based analysis could provide.
+        """
+        incident     = context["incident"]
+        enriched     = context["enriched"]
+        forensic_data = context["forensic_snapshot"]
+        has_live_data = context["has_live_forensics"]
+
+        log.info("Performing root cause analysis",
+                 incident_id=incident.get("id"),
+                 has_live_data=has_live_data)
         
         try:
-            # Build comprehensive context for LLM
-            context = {
-                "incident": request,
-                "data_quality": "excellent" if has_live_data else "good",
-                "live_attack_captured": has_live_data,
+            llm_context = {
+                # Core incident info
+                "incident": incident,
+                "severity": incident.get("severity"),
+                "incident_type": incident.get("type"),
+                "resource": incident.get("resource"),
+                "mitre_mapping": context.get("mitre_mapping", {}),
+                "asset_criticality": context.get("asset_criticality", {}),
+
+                # Triage intelligence
+                "triage": {
+                    "confidence": enriched.get("confidence"),
+                    "llm_summary": enriched.get("llm_summary"),
+                    "recommended_actions": enriched.get("recommended_actions", []),
+                },
+
+                # LLM reasoning steps from triage
+                "reasoning_chain": context.get("reasoning_chain", []),
+
+                # What containment was attempted and how it went
+                "containment_summary": context.get("containment_summary", {}),
+                "retry_history": context.get("retry_history", []),
+
+                # Forensic evidence quality
                 "forensic_summary": {
-                    "artifacts_collected": forensic_data.get("artifacts_collected", 0),
-                    "evidence_package": forensic_data.get("evidence_package", "Not available"),
-                    "has_live_processes": has_live_data,
-                    "has_live_network": has_live_data
+                    "has_live_data": has_live_data,
+                    "artifacts_collected": len(forensic_data.get("artifacts", [])),
+                    "data_quality": "excellent" if has_live_data else "standard",
                 },
-                "log_summary": {
-                    "total_logs": log_analysis.get("total_logs_analyzed", 0),
-                    "suspicious_patterns": len(log_analysis.get("suspicious_patterns", []))
-                },
-                "network_summary": {
-                    "total_connections": network_analysis.get("total_connections", 0),
-                    "unique_destinations": network_analysis.get("summary", {}).get("unique_destinations", 0)
-                },
-                "timeline_events": len(timeline),
+
+                # Derived signals
                 "iocs_found": {
                     "ips": len(iocs.get("ips", [])),
                     "domains": len(iocs.get("domains", [])),
-                    "commands": len(iocs.get("suspicious_commands", []))
+                    "commands": len(iocs.get("suspicious_commands", [])),
+                    "top_ips": iocs.get("ips", [])[:5],
+                    "top_domains": iocs.get("domains", [])[:5],
+                    "top_commands": iocs.get("suspicious_commands", [])[:3],
                 },
                 "lateral_movement_risk": lateral_movement.get("overall_risk_score", 0),
-                "key_timeline_events": timeline[-10:] if timeline else [],  # Last 10 events
-                "top_iocs": {
-                    "ips": iocs.get("ips", [])[:5],  # Top 5 IPs
-                    "domains": iocs.get("domains", [])[:5],  # Top 5 domains
-                    "commands": iocs.get("suspicious_commands", [])[:3]  # Top 3 commands
-                }
+                "key_timeline_events": timeline[-10:] if timeline else [],
+                "timeline_events": len(timeline),
+
+                # Phase updates from other agents (triage summary, containment outcome, etc.)
+                "phase_updates": context.get("phase_updates", {}),
             }
             
-            # Use enhanced LLM analysis with live data context
             root_cause_analysis = await llm_client.analyze_incident_root_cause(
-                incident=request,
-                context=context
+                incident=incident,
+                context=llm_context
             )
             
-            # Enhance analysis based on data quality
-            if has_live_data:
-                root_cause_analysis["data_quality"] = "excellent"
-                root_cause_analysis["analysis_note"] = "Analysis based on live attack data captured during active threat"
-            else:
-                root_cause_analysis["data_quality"] = "limited"
-                root_cause_analysis["analysis_note"] = "Analysis based on post-incident forensic collection"
+            root_cause_analysis["data_quality"] = "excellent" if has_live_data else "standard"
+            root_cause_analysis["analysis_note"] = (
+                "Analysis based on live attack data and full pipeline context"
+                if has_live_data else
+                "Analysis based on post-incident forensics and full pipeline context"
+            )
             
             log.info("Root cause analysis completed",
-                    confidence=root_cause_analysis.get("confidence", 0),
-                    has_live_data=has_live_data)
+                    confidence=root_cause_analysis.get("confidence", 0))
             
             return root_cause_analysis
         
         except Exception as e:
             log.error("Root cause analysis failed", error=str(e))
-            
-            # Enhanced fallback analysis
             return {
-                "summary": f"Automated analysis for incident {request.get('incident_id', 'unknown')}",
+                "summary": f"Automated analysis for incident {incident.get('id', 'unknown')}",
                 "attack_vector": "Unknown - Analysis failed",
                 "confidence": 0.5 if has_live_data else 0.3,
-                "data_quality": "excellent" if has_live_data else "limited",
+                "data_quality": "excellent" if has_live_data else "standard",
                 "recommendations": [
                     "Review forensic evidence manually",
                     "Investigate suspicious IOCs found",
                     "Monitor for lateral movement indicators"
                 ],
                 "error": str(e),
-                "analysis_note": f"Analysis failed - {'Live' if has_live_data else 'Post-incident'} data available"
             }
     
     def _generate_investigation_report(self, **kwargs) -> Dict[str, Any]:
@@ -779,146 +816,27 @@ class InvestigationAgent:
         
         return report
     
-    # [Keep all existing helper methods from original file]
-    # _analyze_logs, _analyze_network_activity, _analyze_host_state, 
-    # _reconstruct_timeline, _extract_iocs, _analyze_lateral_movement, etc.
-    
     def get_stats(self) -> Dict[str, Any]:
-        """Get enhanced investigation agent statistics."""
+        """Get investigation agent statistics."""
         return {
             "total_investigations": self.investigation_count,
             "successful_investigations": self.success_count,
-            "live_snapshots_used": self.live_snapshots_used,
-            "live_snapshot_usage_rate": (
-                self.live_snapshots_used / self.investigation_count 
-                if self.investigation_count > 0 else 0
-            ),
             "success_rate": (
-                self.success_count / self.investigation_count 
+                self.success_count / self.investigation_count
                 if self.investigation_count > 0 else 0
             ),
-            "collectors_available": self.collector_manager.list_collectors() if self.collector_manager else []
         }
     
-    # Include all other existing methods from the original investigation.py file...
-    # (keeping them the same for compatibility)
     
-    async def _analyze_logs(self, incident_id: str, resource: str) -> Dict[str, Any]:
-        """Analyze logs for suspicious patterns."""
-        log.info("Analyzing logs", incident_id=incident_id)
-        
-        log_collector = self.collector_manager.get_collector('log_collector')
-        if not log_collector:
-            log.warning("Log collector not available")
-            return {"logs": [], "patterns": []}
-        
-        try:
-            # Get logs for the incident timeframe
-            logs = await log_collector.get_logs_for_incident(resource, time_range=7200)  # 2 hours
-            
-            # Search for suspicious patterns
-            suspicious_patterns = []
-            threat_patterns = [
-                'error', 'exception', 'fail', 'attack', 'malware',
-                'unauthorized', 'denied', 'blocked', 'suspicious'
-            ]
-            
-            for pattern in threat_patterns:
-                pattern_logs = await log_collector.search_logs_by_pattern(
-                    pattern, time_range=7200
-                )
-                if pattern_logs:
-                    suspicious_patterns.append({
-                        'pattern': pattern,
-                        'matches': len(pattern_logs),
-                        'logs': pattern_logs[:5]  # First 5 matches
-                    })
-            
-            log.info("Log analysis completed",
-                    total_logs=len(logs),
-                    suspicious_patterns=len(suspicious_patterns))
-            
-            return {
-                "logs": logs,
-                "suspicious_patterns": suspicious_patterns,
-                "total_logs_analyzed": len(logs)
-            }
-        
-        except Exception as e:
-            log.error("Log analysis failed", error=str(e))
-            return {"logs": [], "patterns": []}
-    
-    async def _analyze_network_activity(self, incident_id: str) -> Dict[str, Any]:
-        """Analyze network activity for the incident."""
-        log.info("Analyzing network activity", incident_id=incident_id)
-        
-        network_collector = self.collector_manager.get_collector('network_collector')
-        if not network_collector:
-            log.warning("Network collector not available")
-            return {"connections": [], "summary": {}}
-        
-        try:
-            # Get network connections for incident timeframe
-            connections = await network_collector.get_connections_for_incident(timeframe=7200)
-            
-            # Get connection summary
-            summary = await network_collector.get_connection_summary()
-            
-            log.info("Network analysis completed",
-                    connections=len(connections),
-                    unique_destinations=summary.get("unique_destinations", 0))
-            
-            return {
-                "connections": connections,
-                "summary": summary,
-                "total_connections": len(connections)
-            }
-        
-        except Exception as e:
-            log.error("Network analysis failed", error=str(e))
-            return {"connections": [], "summary": {}}
-    
-    async def _analyze_host_state(self, incident_id: str) -> Dict[str, Any]:
-        """Analyze host state and processes."""
-        log.info("Analyzing host state", incident_id=incident_id)
-        
-        host_collector = self.collector_manager.get_collector('host_collector')
-        if not host_collector:
-            log.warning("Host collector not available")
-            return {"processes": [], "system_info": {}}
-        
-        try:
-            # Get process snapshot
-            process_snapshot = await host_collector.get_process_snapshot()
-            
-            # Get system information
-            system_info = await host_collector.get_system_info()
-            
-            log.info("Host analysis completed",
-                    processes=process_snapshot.get("total_processes", 0))
-            
-            return {
-                "process_snapshot": process_snapshot,
-                "system_info": system_info
-            }
-        
-        except Exception as e:
-            log.error("Host analysis failed", error=str(e))
-            return {"processes": [], "system_info": {}}
-    
-    async def _reconstruct_timeline(self, request: Dict[str, Any], 
-                                   forensic_data: Dict[str, Any],
-                                   log_analysis: Dict[str, Any],
-                                   network_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _reconstruct_timeline(self, incident: Dict[str, Any],
+                              forensic_data: Dict[str, Any],
+                              log_analysis: Dict[str, Any],
+                              network_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Reconstruct timeline of events."""
         log.info("Reconstructing timeline")
         
         reconstructor = TimelineReconstructor()
-        
-        # Add incident detection event
-        reconstructor.add_incident_timeline(request)
-        
-        # Add forensic events
+        reconstructor.add_incident_timeline(incident)
         reconstructor.add_forensic_timeline(forensic_data)
         
         # Add log events
@@ -979,7 +897,7 @@ class InvestigationAgent:
         log.info("IOC extraction completed", total_iocs=total_iocs)
         return all_iocs
     
-    async def _analyze_lateral_movement(self, network_analysis: Dict[str, Any],
+    def _analyze_lateral_movement(self, network_analysis: Dict[str, Any],
                                        log_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze potential lateral movement."""
         log.info("Analyzing lateral movement")

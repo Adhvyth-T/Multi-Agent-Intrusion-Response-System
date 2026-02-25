@@ -5,6 +5,8 @@ from .trust_engine import trust_engine, ProgressiveTrustEngine
 from .containment import containment_agent, ContainmentAgent
 from .validation_service import validation_service
 from .investigation import investigation_agent, InvestigationAgent
+from .context import ContextAgent, context_agent
+from .decision_agent import DecisionAgent, decision_agent
 __all__ = [
     'detection_agent',
     'DetectionAgent',
@@ -18,5 +20,9 @@ __all__ = [
     'ContainmentAgent',
     'validation_service',
     'investigation_agent',
-    'InvestigationAgent'
+    'InvestigationAgent',
+    'ContextAgent',
+    'context_agent',
+    'DecisionAgent',
+    'decision_agent'
 ]

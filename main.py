@@ -33,11 +33,11 @@ async def main():
     from core.actions import ActionRegistry
     from agents import (
         detection_agent, communication_agent, triage_agent, 
-        trust_engine, containment_agent,validation_service, investigation_agent
+        containment_agent,validation_service, investigation_agent,context_agent, decision_agent
     )
     from collectors import CollectorFactory
     from config import config
-    from agents.investigation import set_global_forensic_collector
+    
     log.info("="*60)
     log.info("🚀 Autonomous Incident Response System")
     log.info("="*60)
@@ -136,8 +136,12 @@ async def main():
     #Start Investigation Collectors 
     forensic_collector = collector['forensic_collector']  # Get from collector dict
     agents.append(asyncio.create_task(forensic_collector.start(), name="forensic_collector"))
-    set_global_forensic_collector(forensic_collector)
+    
     log.info("✓ Global Forensic Collector registered for live snapshot sharing")
+
+    
+    context_agent.set_forensic_collector(forensic_collector)
+    log.info("✓ Forensic collector registered with Context Agent")
 
     # Start Communication Agent (handles all notifications)
     agents.append(asyncio.create_task(communication_agent.start(), name="communication"))
@@ -152,8 +156,8 @@ async def main():
     log.info("✓ Triage Agent started")
     
     # Start Trust Engine (decides auto vs approval)
-    agents.append(asyncio.create_task(trust_engine.start(), name="trust_engine"))
-    log.info("✓ Progressive Trust Engine started")
+    agents.append(asyncio.create_task(decision_agent.start(), name="decision_agent"))
+    log.info("✓ Decision Agent started")
     
     # Start Containment Agent (executes actions)
     agents.append(asyncio.create_task(containment_agent.start(), name="containment"))
@@ -256,9 +260,10 @@ async def main():
     detection_agent.running = False
     communication_agent.running = False
     triage_agent.running = False
-    trust_engine.running = False
     containment_agent.running = False
     investigation_agent.running = False
+    context_agent.running = False
+    decision_agent.running = False
     
     # Cancel all tasks
     for task in agents:
