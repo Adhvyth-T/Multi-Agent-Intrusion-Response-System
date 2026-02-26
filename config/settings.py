@@ -24,6 +24,12 @@ class Config:
     smtp_user: str = field(default_factory=lambda: os.getenv("SMTP_USER", ""))
     smtp_password: str = field(default_factory=lambda: os.getenv("SMTP_PASSWORD", ""))
     alert_email: str = field(default_factory=lambda: os.getenv("ALERT_EMAIL", ""))
+
+     # IMAP (for reading approval replies)
+    imap_host: str = field(default_factory=lambda: os.getenv("IMAP_HOST", ""))
+    imap_port: int = field(default_factory=lambda: int(os.getenv("IMAP_PORT", "993")))
+    imap_user: str = field(default_factory=lambda: os.getenv("IMAP_USER", ""))
+    imap_password: str = field(default_factory=lambda: os.getenv("IMAP_PASSWORD", ""))
     
     # Trust Engine
     trust_level_1_max_actions: int = 50

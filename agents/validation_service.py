@@ -92,6 +92,20 @@ class ValidationService:
             )
             return
 
+        # Execution failed before reaching validation — context already has the failure
+        # message from ContainmentAgent._update_context_after_execution.
+        # Skip Phase 2/3, trigger retry loop so Decision Agent picks a different action.
+        if request.get("execution_failed"):
+            failure_message = request.get("failure_message") or f"Action {action_type} execution failed"
+            log.warning("Action execution failed — triggering retry loop",
+                        incident_id=incident_id, action_type=action_type,
+                        failure_message=failure_message)
+            await self._handle_validation_failure(
+                incident_id, action_id, action_type, resource,
+                phase="phase1", failure_message=failure_message,
+            )
+            return
+
         executor_class = ActionRegistry.get(action_type)
         if not executor_class:
             log.error("Unknown action type for validation", action_type=action_type)

@@ -131,17 +131,20 @@ class ContainmentAgent:
             "duration_seconds": result.duration_seconds
         })
 
-        # Push to validation if action succeeded, even if immediate verification is partial.
-        # "partial" means the action ran (e.g. container paused) but the verify check
-        # had a timing issue (Docker status not yet updated). Let Phase 2 be the real judge.
-        if result.success:
-            await queue.push("validation", {
-                "incident_id": incident_id,
-                "action_id": action_id,
-                "action_type": action_type,
-                "result": result.to_dict(),
-                "resource": action_data.get("resource", "unknown")
-            })
+        # Always push to validation — on success Phase 2+3 run normally.
+        # On failure, ValidationService detects execution_failed=True and immediately
+        # calls _handle_validation_failure → Decision Agent retry loop with full context.
+        # "partial" means the action ran but immediate verify had a timing issue —
+        # Phase 2 is the real judge, so that also goes through normally.
+        await queue.push("validation", {
+            "incident_id": incident_id,
+            "action_id": action_id,
+            "action_type": action_type,
+            "result": result.to_dict(),
+            "resource": action_data.get("resource", "unknown"),
+            "execution_failed": not result.success,
+            "failure_message": result.message if not result.success else None,
+        })
 
     async def _execute_action_workflow(
         self,

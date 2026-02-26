@@ -1,7 +1,11 @@
-# agents/detection.py (UPDATED WITH EARLY FORENSIC TRIGGER)
 """
-Detection Agent - Now captures LIVE forensic evidence immediately upon detection.
-This ensures rich forensic data is collected while the attack is still active.
+Detection Agent - Combined implementation
+Features:
+- ML-based detection with multiple specialized models
+- Hard signature overrides for deterministic threats
+- Collector threat normalization
+- Incident deduplication (cooldown based)
+- Immediate forensic snapshot trigger for live attacks
 """
 
 import asyncio
@@ -23,6 +27,7 @@ from ml_models import (
 )
 
 log = structlog.get_logger()
+
 
 @dataclass
 class DetectedEvent:
@@ -47,13 +52,7 @@ class IncidentDeduplicator:
         self.cooldown_minutes = cooldown_minutes
     
     def get_fingerprint(self, resource: str, threat_type: str, namespace: str) -> str:
-        """
-        Create unique fingerprint for an incident.
-        
-        Examples:
-        - container/nginx + cryptominer + docker = "abc123def456"
-        - container/redis + privilege_escalation + docker = "xyz789abc123"
-        """
+        """Create unique fingerprint for an incident."""
         key = f"{resource}|{threat_type}|{namespace}"
         fingerprint = hashlib.md5(key.encode()).hexdigest()[:12]
         return fingerprint
@@ -61,13 +60,10 @@ class IncidentDeduplicator:
     def is_duplicate(self, resource: str, threat_type: str, namespace: str) -> tuple[bool, Optional[str]]:
         """
         Check if this incident was recently created.
-        
-        Returns:
-            (is_duplicate, existing_incident_id)
+        Returns (is_duplicate, existing_incident_id)
         """
         fingerprint = self.get_fingerprint(resource, threat_type, namespace)
         
-        # Check if we have an active incident with this fingerprint
         if fingerprint in self.active_incidents:
             incident_data = self.active_incidents[fingerprint]
             last_seen = incident_data['last_seen']
@@ -91,7 +87,7 @@ class IncidentDeduplicator:
                 
                 return True, incident_id
         
-        # Not a duplicate - return False
+        # Not a duplicate
         return False, None
     
     def register_incident(self, resource: str, threat_type: str, namespace: str, incident_id: str):
@@ -156,95 +152,279 @@ class IncidentDeduplicator:
 
 
 class MultiModelDetector:
-    """Ensemble of specialized ML models for different attack types."""
-    
+    """
+    Ensemble of specialized ML models with:
+
+    1️⃣ Collector type overrides (direct event type)
+    2️⃣ Collector threat normalization (cpu_bomb)
+    3️⃣ Hard signature overrides (deterministic)
+    4️⃣ ML detection with threshold
+    5️⃣ Severity + confidence prioritization
+    """
+
+    CONFIDENCE_THRESHOLD = 0.75  # Minimum ML confidence
+
     def __init__(self):
         log.info("Initializing ML detection models...")
+
         self.cryptominer = CryptominerDetector()
         self.exfiltration = ExfiltrationDetector()
         self.privilege = PrivilegeDetector()
         self.shell = ReverseShellDetector()
         self.escape = ContainerEscapeDetector()
         self.network = NetworkAnomalyDetector()
-        
-        log.info("ML models loaded", 
-                 trained=[
-                     f"cryptominer: {self.cryptominer.trained}",
-                     f"exfiltration: {self.exfiltration.trained}",
-                     f"privilege: {self.privilege.trained}",
-                     f"shell: {self.shell.trained}",
-                     f"network: {self.network.trained}"
-                 ])
-    
-    def detect(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Run all models and return best match."""
-        results = []
-        
-        # Run each specialized detector
-        detectors = [
-            ('cryptominer', self.cryptominer, Severity.P1),
-            ('data_exfiltration', self.exfiltration, Severity.P1),
-            ('privilege_escalation', self.privilege, Severity.P1),
-            ('reverse_shell', self.shell, Severity.P1),
-            ('container_escape', self.escape, Severity.P1),
-            ('suspicious_process', self.network, Severity.P2)
+
+        log.info(
+            "ML models loaded",
+            trained=[
+                f"cryptominer: {self.cryptominer.trained}",
+                f"exfiltration: {self.exfiltration.trained}",
+                f"privilege: {self.privilege.trained}",
+                f"reverse_shell: {self.shell.trained}",
+                f"container_escape: {self.escape.trained}",
+                f"network: {self.network.trained}",
+            ],
+        )
+
+    def detect(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Detection priority:
+
+        1️⃣ Collector type overrides
+        2️⃣ Collector threat normalization
+        3️⃣ Hard signature overrides
+        4️⃣ ML models (threshold gated)
+        5️⃣ Severity (P1 > P2) then confidence
+        """
+
+        details = event.get("details", {})
+        command = str(details.get("command", "")).lower()
+        process = str(details.get("process", "")).lower()
+        collector_threat = str(details.get("threat", "")).lower()
+        event_type = str(event.get("type", "")).lower()
+        event_blob = str(event).lower()
+
+        # ============================================================
+        # 1️⃣ COLLECTOR TYPE OVERRIDE
+        # ============================================================
+        if event_type in [
+            "privilege_escalation",
+            "cryptominer",
+            "reverse_shell",
+            "container_escape",
+            "port_scan",
+            "data_exfiltration"
+        ]:
+            log.info("Collector type override triggered", threat=event_type)
+
+            severity = Severity.P1
+            if event_type == "port_scan":
+                severity = Severity.P2  # Lower severity for scans
+
+            return {
+                "threat_type": event_type,
+                "severity": severity,
+                "confidence": 0.95,
+                "detector": "collector_type_override"
+            }
+
+        # ============================================================
+        # 2️⃣ COLLECTOR THREAT NORMALIZATION
+        # ============================================================
+        if collector_threat == "cpu_bomb":
+            log.info("Collector override triggered: CPU bomb detected")
+            return {
+                "threat_type": "anomalous_cpu",
+                "severity": Severity.P2,
+                "confidence": 0.95,
+                "detector": "collector_cpu_bomb",
+                "subtype": "cpu_bomb",
+            }
+
+        # ============================================================
+        # 3️⃣ HARD SIGNATURE OVERRIDE — CRYPTOMINER
+        # ============================================================
+        if "xmrig" in event_blob:
+            log.info("Signature override triggered: xmrig detected")
+            return {
+                "threat_type": "cryptominer",
+                "severity": Severity.P1,
+                "confidence": 0.98,
+                "detector": "signature_xmrig",
+            }
+
+        # ============================================================
+        # 4️⃣ HARD SIGNATURE OVERRIDE — CPU BOMB (Pattern Based)
+        # ============================================================
+        cpu_patterns = [
+            "while true",
+            ":(){ :|:& };:",   # fork bomb
+            "fork bomb",
         ]
-        
+        if any(pattern in event_blob for pattern in cpu_patterns):
+            log.info("Signature override triggered: CPU bomb pattern detected")
+            return {
+                "threat_type": "anomalous_cpu",
+                "severity": Severity.P2,
+                "confidence": 0.95,
+                "detector": "signature_cpu_bomb",
+                "subtype": "cpu_bomb",
+            }
+
+        # ============================================================
+        # 5️⃣ HARD SIGNATURE OVERRIDE — REVERSE SHELL
+        # ============================================================
+        reverse_shell_patterns = [
+            "/dev/tcp/",
+            "bash -i",
+            "nc -e",
+            "nc.exe -e",
+            "ncat -e",
+            "powershell -nop",
+            "powershell -enc",
+        ]
+        if any(pattern in event_blob for pattern in reverse_shell_patterns):
+            log.info("Signature override triggered: reverse shell detected")
+            return {
+                "threat_type": "reverse_shell",
+                "severity": Severity.P1,
+                "confidence": 0.98,
+                "detector": "signature_reverse_shell",
+            }
+
+        # ============================================================
+        # 6️⃣ HARD SIGNATURE OVERRIDE — NETWORK SCANNING
+        # ============================================================
+        scan_tools = [
+            "nmap",
+            "masscan",
+            "zmap",
+            "unicornscan",
+            "nikto",
+            "gobuster",
+        ]
+        if any(tool in command or tool in process for tool in scan_tools):
+            log.info("Signature override triggered: scan tool detected")
+            try:
+                _, confidence = self.network.predict(event)
+            except Exception:
+                confidence = 0.85
+            return {
+                "threat_type": "port_scan",
+                "severity": Severity.P2,
+                "confidence": max(confidence, 0.85),
+                "detector": "signature_scan_tool",
+            }
+
+        # ============================================================
+        # 7️⃣ HARD SIGNATURE OVERRIDE — PRIVILEGE ESCALATION
+        # ============================================================
+        privilege_patterns = [
+            "chmod 777",
+            "find / -perm",
+            "sudo -l",
+            "passwd",
+            "newgrp",
+            "chsh",
+            "chfn",
+            "gpasswd",
+            "mount",
+            "umount"
+        ]
+        file_redirection = [">", ">>"]
+        if any(pattern in command for pattern in privilege_patterns) or any(redir in command for redir in file_redirection):
+            log.info("Signature override triggered: privilege escalation / dangerous command detected")
+            return {
+                "threat_type": "privilege_escalation",
+                "severity": Severity.P1,
+                "confidence": 0.99,
+                "detector": "signature_privilege",
+            }
+
+        # ============================================================
+        # 8️⃣ ML MODEL DETECTIONS (THRESHOLD GATED)
+        # ============================================================
+        detectors = [
+            ("cryptominer", self.cryptominer, Severity.P1),
+            ("data_exfiltration", self.exfiltration, Severity.P1),
+            ("privilege_escalation", self.privilege, Severity.P1),
+            ("reverse_shell", self.shell, Severity.P1),
+            ("container_escape", self.escape, Severity.P1),
+            ("port_scan", self.network, Severity.P2),
+        ]
+
+        results = []
+
         for threat_type, detector, severity in detectors:
-            is_threat, confidence = detector.predict(event)
-            if is_threat:
-                results.append({
-                    'threat_type': threat_type,
-                    'severity': severity,
-                    'confidence': confidence,
-                    'detector': detector.model_name
-                })
-        
-        # Return highest confidence detection
-        if results:
-            best = max(results, key=lambda x: x['confidence'])
-            return best
-        
-        return None
+            try:
+                is_threat, confidence = detector.predict(event)
+                if is_threat and confidence >= self.CONFIDENCE_THRESHOLD:
+                    results.append({
+                        "threat_type": threat_type,
+                        "severity": severity,
+                        "confidence": confidence,
+                        "detector": detector.model_name,
+                    })
+            except Exception as e:
+                log.error("Detector error", detector=detector.model_name, error=str(e))
+
+        if not results:
+            return None
+
+        # ============================================================
+        # 9️⃣ PRIORITIZATION
+        #   - Higher severity first (P1 > P2)
+        #   - Then higher confidence
+        # ============================================================
+        results.sort(key=lambda x: (x["severity"].value, x["confidence"]), reverse=True)
+        best = results[0]
+
+        log.info(
+            "ML detection selected",
+            threat_type=best["threat_type"],
+            severity=best["severity"].value,
+            confidence=best["confidence"],
+            detector=best["detector"],
+        )
+        return best
 
 
 class DetectionAgent:
-    """Main detection agent using specialized ML models."""
-    
+    """Main detection agent using specialized ML models + deduplication + early forensics."""
+
     def __init__(self, dedup_cooldown_minutes: int = 5):
         self.detector = MultiModelDetector()
         self.deduplicator = IncidentDeduplicator(cooldown_minutes=dedup_cooldown_minutes)
         self.running = False
-        
+
         log.info(
             "Detection Agent initialized",
             deduplication_cooldown_minutes=dedup_cooldown_minutes
         )
-    
+
     async def start(self):
         """Start the detection agent."""
         self.running = True
         log.info("Detection Agent started with ML models + deduplication + early forensics")
         await self._event_loop()
-    
+
     async def stop(self):
         """Stop the detection agent."""
         self.running = False
         log.info("Detection Agent stopped")
-    
+
     async def _event_loop(self):
         """Main event processing loop."""
         while self.running:
             try:
                 event_data = await queue.pop("detection", timeout=5)
-                
                 if event_data:
                     event = self._normalize_event(event_data)
                     await self._process_event(event)
             except Exception as e:
                 log.error("Error processing event", error=str(e))
                 await asyncio.sleep(1)
-    
+
     def _normalize_event(self, raw_event: Dict[str, Any]) -> DetectedEvent:
         """Normalize raw event into standard format."""
         return DetectedEvent(
@@ -256,11 +436,11 @@ class DetectionAgent:
             details=raw_event.get("details", {}),
             raw=raw_event
         )
-    
+
     async def _process_event(self, event: DetectedEvent):
         """Process event through ML models."""
         log.info("Processing event", source=event.source, type=event.event_type)
-        
+
         # Convert to dict for ML models
         event_dict = {
             'source': event.source,
@@ -270,10 +450,10 @@ class DetectionAgent:
             'details': event.details,
             'raw': event.raw
         }
-        
-        # Run ML detection
+
+        # Run detection
         detection = self.detector.detect(event_dict)
-        
+
         if detection:
             # Check for duplicates BEFORE creating incident
             is_duplicate, existing_id = self.deduplicator.is_duplicate(
@@ -281,7 +461,7 @@ class DetectionAgent:
                 threat_type=detection['threat_type'],
                 namespace=event.namespace
             )
-            
+
             if is_duplicate:
                 log.info(
                     "Duplicate detection ignored",
@@ -290,16 +470,16 @@ class DetectionAgent:
                     threat_type=detection['threat_type']
                 )
                 return  # Skip creating new incident
-            
+
             # NEW threat detected! Create incident
             incident = await self._create_incident(
                 event,
                 detection['threat_type'],
                 detection['severity'],
                 detection['confidence'],
-                [f"ML Detection: {detection['detector']} (confidence: {detection['confidence']:.2f})"]
+                [f"Detection: {detection['detector']} (confidence: {detection['confidence']:.2f})"]
             )
-              
+
             # Register for deduplication
             self.deduplicator.register_incident(
                 resource=event.resource,
@@ -307,12 +487,12 @@ class DetectionAgent:
                 namespace=event.namespace,
                 incident_id=incident.id
             )
-            
+
             # 🚨 IMMEDIATE FORENSIC CAPTURE - While attack is still active!
-            log.info("Triggering immediate forensic capture", 
-                    incident_id=incident.id,
-                    threat_type=detection['threat_type'])
-            
+            log.info("Triggering immediate forensic capture",
+                     incident_id=incident.id,
+                     threat_type=detection['threat_type'])
+
             await queue.push("forensic_snapshot", {
                 "incident_id": incident.id,
                 "resource": incident.resource,
@@ -321,12 +501,12 @@ class DetectionAgent:
                 "reason": "live_attack_capture",
                 "severity": incident.severity.value,
                 "confidence": detection['confidence'],
-                "detector": detection['detector']
+                "detector": detection.get('detector', 'unknown')
             })
-            
+
             # Push to triage queue (parallel processing)
             await queue.push("triage", incident.model_dump(mode='json'))
-            
+
             # Send notification
             await queue.push("notification", {
                 "type": "incident_detected",
@@ -334,16 +514,16 @@ class DetectionAgent:
                 "severity": incident.severity.value,
                 "threat_type": detection['threat_type'],
                 "resource": incident.resource,
-                "summary": f"ML Detection: {detection['threat_type']} (confidence: {detection['confidence']:.0%}) - Live forensics triggered",
+                "summary": f"Detection: {detection['threat_type']} (confidence: {detection['confidence']:.0%}) - Live forensics triggered",
                 "forensic_capture": True
             })
-            
+
             log.info("New incident created with live forensic capture",
                      incident_id=incident.id,
                      threat_type=detection['threat_type'],
                      confidence=detection['confidence'],
-                     detector=detection['detector'])
-    
+                     detector=detection.get('detector', 'unknown'))
+
     async def _create_incident(
         self,
         event: DetectedEvent,
@@ -353,7 +533,6 @@ class DetectionAgent:
         reasons: List[str]
     ) -> Incident:
         """Create and save incident from detected event."""
-        
         incident = Incident(
             type=threat_type,
             severity=severity,
@@ -368,12 +547,12 @@ class DetectionAgent:
                 "forensic_triggered": True  # Mark that forensics were triggered
             }
         )
-        
+
         # Save to database
         await save_incident(incident.model_dump(mode='json'))
-        
+
         return incident
-    
+
     def get_dedup_stats(self) -> Dict[str, Any]:
         """Get deduplication statistics (for debugging/monitoring)."""
         return self.deduplicator.get_stats()
