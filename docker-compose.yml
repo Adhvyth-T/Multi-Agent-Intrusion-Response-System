@@ -1,4 +1,47 @@
 services:
+
+  # ── IR System Infrastructure ─────────────────────────────────────
+
+  ir-redis:
+    image: redis:7-alpine
+    container_name: ir-redis
+    restart: unless-stopped
+    networks:
+      - ir-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ir-system:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ir-system
+    restart: unless-stopped
+    depends_on:
+      ir-redis:
+        condition: service_healthy
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - REDIS_URL=redis://ir-redis:6379
+      - IR_COLLECTOR=docker
+      - IR_DRY_RUN=${IR_DRY_RUN:-false}
+      - IR_ENABLE_SNAPSHOTS=${IR_ENABLE_SNAPSHOTS:-true}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # monitor containers
+      - ir-data:/app/data                               # SQLite persistence
+      - ir-snapshots:/app/snapshots                     # forensic snapshots
+    networks:
+      - ir-net
+      - attack-net                                      # see victim containers
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Attack Surface ───────────────────────────────────────────────
+
   falco:
     image: falcosecurity/falco:0.37.1
     container_name: ir-falco
@@ -32,5 +75,11 @@ services:
       - attack-net
 
 networks:
+  ir-net:
+    driver: bridge
   attack-net:
     driver: bridge
+
+volumes:
+  ir-data:
+  ir-snapshots:

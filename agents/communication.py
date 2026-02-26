@@ -267,7 +267,8 @@ class CommunicationAgent:
             # Format body
             body_data = notification.copy()
             
-            # Handle special formatting for certain fields
+            # Handle special formatting for actions list before applying defaults,
+            # so the list->string conversion happens before format() is called.
             if "actions" in body_data and isinstance(body_data["actions"], list):
                 body_data["actions"] = "\n".join(
                     f"  - {a.get('action', a)}" for a in body_data["actions"]
@@ -282,6 +283,8 @@ class CommunicationAgent:
                 "summary": "No summary available",
                 "confidence": 0.0,
                 "action_mode": "Unknown",
+                # triage_complete sends no actions — Decision Agent determines them later
+                "actions": "  Pending — Decision Agent will determine containment actions",
                 "reasoning_summary": "No reasoning available",
                 "action_type": "Unknown",
                 "status": "Unknown",
@@ -289,7 +292,8 @@ class CommunicationAgent:
                 "duration": "Unknown",
                 "actions_count": 0,
                 "action_id": "N/A",
-                "action_details": "No details available"
+                "action_details": "No details available",
+                "max_retries": "N/A",
             }
             
             # Merge defaults with body_data (body_data takes precedence)
